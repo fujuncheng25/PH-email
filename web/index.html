@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#191919">
+<title>Email Chatter · 邮件即时通讯</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <!-- ===== 左侧边栏 ===== -->
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span class="brand-name">Email Chatter</span>
+      </div>
+      <div class="header-actions">
+        <button id="btn-friend" class="icon-btn" title="添加好友">＋</button>
+        <button id="btn-settings" class="icon-btn" title="设置">⚙</button>
+      </div>
+    </div>
+    <div id="search-box"><input id="search-input" type="text" placeholder="搜索好友…"></div>
+    <div id="status-bar">
+      <span id="status-dot" class="dot"></span>
+      <span id="status-text">未连接</span>
+      <button id="btn-poll" class="mini-btn" title="立即收信">刷新</button>
+    </div>
+    <div id="offline-banner" style="display:none">离线模式：仅显示缓存消息</div>
+    <ul id="friend-list"></ul>
+    <div id="friend-empty" class="empty-hint">
+      还没有好友<br>点击右上角 <b>＋</b> 添加
+    </div>
+  </aside>
+
+  <!-- ===== 右侧聊天区 ===== -->
+  <main id="chat">
+    <div id="chat-empty" class="chat-placeholder">
+      <div class="placeholder-logo">✉</div>
+      <h2>Email Chatter</h2>
+      <p>基于 SMTP / POP3 / IMAP 的邮件即时通讯</p>
+      <p class="sub">只有白名单好友的邮件才会出现在这里，其余邮件请在邮箱官网查看</p>
+    </div>
+    <div id="chat-active" style="display:none">
+      <header id="chat-header">
+        <span id="chat-avatar" class="avatar"></span>
+        <div class="chat-title">
+          <div id="chat-name"></div>
+          <div id="chat-note" class="chat-note"></div>
+        </div>
+        <button id="btn-remove" class="icon-btn danger" title="删除好友">✕</button>
+      </header>
+      <div id="messages"></div>
+      <div id="composer">
+        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+        <button id="btn-send">发送</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ===== 设置弹窗 ===== -->
+<div id="modal-settings" class="modal-backdrop" style="display:none">
+  <div class="modal">
+    <h3>账户设置</h3>
+    <p class="modal-tip">使用网易邮箱等客户端授权码（而非邮箱登录密码）登录。</p>
+    <div class="field"><label>收件箱模式</label>
+      <select id="cfg-mode">
+        <option value="imap">IMAP（推荐，服务器保留邮件）</option>
+        <option value="pop3">POP3（简单）</option>
+      </select>
+    </div>
+    <div class="field"><label>你的邮箱</label><input id="cfg-email" type="email" placeholder="you@163.com"></div>
+    <div class="field"><label>显示名称</label><input id="cfg-name" placeholder="你的昵称（发给好友时显示）"></div>
+    <div class="field"><label>客户端授权密码</label><input id="cfg-pass" type="password" placeholder="授权码，不是登录密码"></div>
+    <p class="modal-tip">
+      服务器只填主机名，不要带 <b>https://</b> 或路径；也可写成 host:port。
+      网易企业邮箱：收件 <b>imaphz.qiye.163.com</b> 993、POP3 <b>pophz.qiye.163.com</b> 995、
+      发信 <b>smtphz.qiye.163.com</b> <b>994</b>，三项都勾选 SSL。
+      <br>自定义域名 / 学校邮箱：服务器以「邮箱托管方」为准（不是看域名）。
+      用 <code>nslookup -type=mx 你的域名</code> 判断：指向 <b>qiye.163.com</b> 就用上面这组
+      （不通再试通用域名 imap/pop/smtp.qiye.163.com）；指向 outlook/google/qq/coremail 的，
+      要换成对应服务商的服务器地址，并可能需要应用专用密码（本客户端不支持 OAuth）。
+    </p>
+    <div class="fieldrow">
+      <div class="field grow"><label>收件服务器 (IMAP)</label><input id="cfg-imap-host" placeholder="imaphz.qiye.163.com"></div>
+      <div class="field small"><label>端口</label><input id="cfg-imap-port" type="number" value="993"></div>
+      <div class="field check"><label><input id="cfg-imap-ssl" type="checkbox" checked> SSL</label></div>
+    </div>
+    <div class="fieldrow">
+      <div class="field grow"><label>POP3 服务器</label><input id="cfg-pop3-host" placeholder="pophz.qiye.163.com"></div>
+      <div class="field small"><label>端口</label><input id="cfg-pop3-port" type="number" value="995"></div>
+      <div class="field check"><label><input id="cfg-pop3-ssl" type="checkbox" checked> SSL</label></div>
+    </div>
+    <div class="fieldrow">
+      <div class="field grow"><label>发信服务器 (SMTP)</label><input id="cfg-smtp-host" placeholder="smtphz.qiye.163.com"></div>
+      <div class="field small"><label>端口</label><input id="cfg-smtp-port" type="number" value="465"></div>
+      <div class="field check"><label><input type="checkbox" id="cfg-smtp-ssl" checked> SSL</label></div>
+    </div>
+    <div class="fieldrow">
+      <div class="field grow"><label>收信间隔（秒）</label><input id="cfg-interval" type="number" value="8"></div>
+      <div class="field check"><label><input id="cfg-auto" type="checkbox" checked> 自动收信</label></div>
+    </div>
+    <div id="test-result" class="test-result"></div>
+    <div id="probe-result" class="test-result"></div>
+    <div class="modal-actions">
+      <button id="btn-probe" class="btn secondary">自动检测服务器</button>
+      <button id="btn-test" class="btn secondary">测试连接</button>
+      <button id="btn-save" class="btn primary">保存</button>
+      <button id="btn-close-settings" class="btn">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 添加好友弹窗 ===== -->
+<div id="modal-friend" class="modal-backdrop" style="display:none">
+  <div class="modal small">
+    <h3>添加好友</h3>
+    <p class="modal-tip">只有加入白名单的邮箱，其来信才会被本客户端处理并显示。</p>
+    <div class="field"><label>邮箱地址</label><input id="fr-email" type="email" placeholder="friend@example.com"></div>
+    <div class="field"><label>备注名</label><input id="fr-name" placeholder="（可选）"></div>
+    <div class="field"><label>备注</label><input id="fr-note" placeholder="（可选）"></div>
+    <div class="modal-actions">
+      <button id="btn-fr-save" class="btn primary">添加</button>
+      <button id="btn-close-friend" class="btn">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

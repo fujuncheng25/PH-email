@@ -1,0 +1,27 @@
+# 构建产物
+build/
+release/
+dist/
+out/
+
+# 运行/测试数据（含明文授权码，绝不入库）
+data/
+demo-data/
+tests/tmp/
+tests/__pycache__/
+__pycache__/
+*.pyc
+
+# 日志与临时文件
+*.log
+*.out
+*.err
+*.tmp
+*.bak
+
+# IDE / 系统
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

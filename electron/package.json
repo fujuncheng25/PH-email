@@ -1,0 +1,45 @@
+{
+  "name": "email-chatter",
+  "productName": "Email Chatter",
+  "version": "1.0.0",
+  "description": "基于 SMTP / POP3 / IMAP 的邮件即时通讯客户端：只处理白名单好友的邮件，其余邮件请到邮箱官网查看。",
+  "main": "main.js",
+  "author": "email-chatter",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test:backend": "node ../tests/e2e_node.js",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "dev.emailchatter.app",
+    "productName": "Email Chatter",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "backend.js",
+      "web/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "target": ["dmg", "zip"],
+      "category": "public.app-category.social-networking"
+    },
+    "win": {
+      "target": ["nsis"]
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Network"
+    }
+  }
+}
