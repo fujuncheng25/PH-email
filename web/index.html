@@ -55,9 +55,53 @@
         <button id="btn-remove" class="icon-btn danger" title="删除好友">✕</button>
       </header>
       <div id="messages"></div>
+
+      <!-- ===== 收起态小输入框 ===== -->
       <div id="composer">
-        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-        <button id="btn-send">发送</button>
+        <div id="collapsed-quote" class="quote-bar" style="display:none"></div>
+        <div id="collapsed-atts" class="att-chips"></div>
+        <div id="composer-row">
+          <div id="composer-tools">
+            <button id="btn-expand" class="composer-tool" title="展开为邮件模式" aria-label="展开为邮件模式">
+              <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M9.5 2.5H13.5V6.5M6.5 13.5H2.5V9.5M13.5 2.5L9 7M2.5 13.5L7 9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button id="btn-attach" class="composer-tool" title="添加附件" aria-label="添加附件">📎</button>
+          </div>
+          <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+          <button id="btn-send">发送</button>
+        </div>
+      </div>
+
+      <!-- ===== 展开态：邮件模式 ===== -->
+      <div id="email-panel" style="display:none">
+        <div id="email-panel-head">
+          <span class="email-panel-title">邮件模式</span>
+          <span id="email-ai-state" class="email-ai-state"></span>
+          <button id="btn-collapse-email" class="btn small" title="收起为小输入框（保留草稿）">收起</button>
+        </div>
+        <div id="email-panel-body">
+          <div class="email-row">
+            <label for="email-subject">主题</label>
+            <input id="email-subject" type="text" maxlength="200" placeholder="留空则自动生成主题">
+            <button id="btn-ai-title" class="btn ai-btn" style="display:none" title="用 AI 生成邮件主题">✨ AI 生成标题</button>
+          </div>
+          <div class="email-row">
+            <label for="email-cc">抄送</label>
+            <input id="email-cc" type="text" placeholder="多个用逗号分隔，可留空">
+          </div>
+          <div class="email-row">
+            <label for="email-bcc">密送</label>
+            <input id="email-bcc" type="text" placeholder="可留空">
+          </div>
+          <div id="email-quote" class="quote-bar" style="display:none"></div>
+          <div id="email-atts" class="att-chips"></div>
+          <textarea id="email-body" placeholder="输入邮件正文…"></textarea>
+          <div id="email-panel-foot">
+            <button id="btn-email-attach" class="composer-tool" title="添加附件" aria-label="添加附件">📎</button>
+            <span class="email-tip">Enter 换行 · Ctrl+Enter 发送 · 内容将作为普通邮件发出</span>
+            <button id="btn-email-send" class="btn primary">发送</button>
+          </div>
+        </div>
       </div>
     </div>
   </main>
@@ -105,6 +149,21 @@
       <div class="field grow"><label>收信间隔（秒）</label><input id="cfg-interval" type="number" value="8"></div>
       <div class="field check"><label><input id="cfg-auto" type="checkbox" checked> 自动收信</label></div>
     </div>
+
+    <!-- ===== AI 标题（可选） ===== -->
+    <div class="modal-section">
+      <h4>AI 标题（可选）</h4>
+      <div class="field check"><label><input id="cfg-ai-enabled" type="checkbox"> 启用 AI 生成邮件标题（本地 Qwen2.5-0.5B）</label></div>
+      <p class="modal-tip ai-tip">首次使用需从 HuggingFace 镜像下载约 400MB 模型，保存在程序目录 data/models/；下载后可离线使用。生成一条标题 C++ 版约需数秒，Electron 版可能需 1–2 分钟。</p>
+      <div id="ai-status" class="ai-status">未下载</div>
+      <div class="ai-actions">
+        <button id="btn-ai-download" class="btn secondary">下载模型</button>
+        <button id="btn-ai-cancel" class="btn">取消下载</button>
+      </div>
+      <div class="field"><label>镜像地址</label><input id="cfg-ai-mirror" placeholder="https://hf-mirror.com"></div>
+      <div class="field"><label>模型直链（可选）</label><input id="cfg-ai-model-url" placeholder="留空使用内置候选地址"></div>
+    </div>
+
     <div id="test-result" class="test-result"></div>
     <div id="probe-result" class="test-result"></div>
     <div class="modal-actions">
@@ -130,6 +189,17 @@
     </div>
   </div>
 </div>
+
+<!-- ===== 图片大图预览 ===== -->
+<div id="lightbox" class="lightbox" style="display:none">
+  <img id="lightbox-img" alt="图片预览">
+</div>
+
+<!-- 附件选择（收起态 / 邮件模式共用） -->
+<input type="file" id="file-input" multiple style="display:none">
+
+<!-- ===== 右键菜单（消息 / 好友共用，JS 动态填充） ===== -->
+<div id="ctx-menu" class="ctx-menu" style="display:none" role="menu"></div>
 
 <div id="toast" class="toast"></div>
 <script src="app.js"></script>

@@ -11,8 +11,14 @@
 
 ## 特性
 
-- 👥 **好友白名单**：只显示、只处理白名单好友的邮件，其它邮件一律不进客户端
-- 💬 **微信风格界面**：左侧好友列表（未读角标、最后消息预览）、右侧会话气泡、Enter 发送
+- 👥 **好友白名单**：只显示、只处理白名单好友的邮件，其它邮件一律不进客户端，且在邮箱里**保持原样（不会被标为已读）**
+- 💬 **微信风格界面**：左侧好友列表（**头像右上角红点未读数**、最后消息预览）、右侧会话气泡、Enter 发送
+- ✉️ **扩展邮件模式**：点输入框左上角的「展开」按钮进入普通邮件编辑器——主题 / 抄送 / 密送 / 大段正文（Enter 换行、Tab 缩进、Ctrl+Enter 发送），发出的就是**标准邮件**，在邮箱里看和普通邮件没有区别
+- 🖼️ **图片与附件收发**：选择 / 拖拽 / 粘贴图片和文件，聊天里显示缩略图或文件卡片（点大图、可下载）；对方用普通邮箱也能正常收到附件
+- ↩️ **引用 = 邮件回复（reply）**：引用任意消息后发送，邮件带 `In-Reply-To` / `References` 线程头和 `Re:` 主题，在邮箱里就是标准回复；双方聊天里同时显示引用卡片
+- 🖱️ **右键菜单**：消息右键可「复制文字 / 引用 / 撤回」；好友列表右键可「删除好友」（只删除好友关系与聊天记录，**不会删除邮箱里的邮件**）
+- 🚮 **撤回**：撤回自己发出的消息（对方也用 Email Chatter 时立即消失；用其它邮箱客户端无法真正收回，界面会提示）
+- 🤖 **可选 AI 标题**（**默认关闭**）：设置里启用后从 HuggingFace 镜像下载 **Qwen2.5-0.5B-Instruct**（GGUF Q4_K_M，约 400MB）到本机 `data/models/`，完全离线为消息生成邮件主题，让「小输入框」发出的聊天消息在普通邮箱里也像正常邮件
 - 📩 双收信模式：**IMAP**（服务器保留已读状态）与 **POP3** 均可
 - 🔒 **TLS/SSL** 支持（OpenSSL / Node tls，可校验证书）
 - 🌍 三种运行形态，一套 UI：
@@ -57,6 +63,25 @@ build\Release\email-chatter.exe          # 自动打开浏览器 → http://127.
 1. 点右上角 **⚙ 设置**，填写邮箱账户与**客户端授权密码**，测试连接后保存；
 2. 点 **＋** 添加好友（把对方邮箱加入白名单）；
 3. 开始聊天。对方也必须做同样的配置并把你加入白名单，才能看到你的消息。
+
+日常使用：
+
+- **小输入框**（默认）：Enter 发送、Shift+Enter 换行，沿用原来的聊天算法；可点 📎 或拖拽 / 粘贴图片、文件一起发送。
+- **扩展邮件模式**：点输入框左上角的 **展开** 按钮（或按需切换），会出现「主题 / 抄送 / 密送 / 正文」的邮件编辑器。Enter 换行、Tab 缩进、Ctrl+Enter（macOS 为 ⌘+Enter）发送；主题留空会在发送时自动生成（启用了 AI 时用本地模型，否则用正文首行截断）。发出的内容是一封标准邮件，普通邮箱用户看到的就是正常邮件。
+- **引用 / 撤回**：悬停消息气泡可点「引用」「撤回」，也支持**右键菜单**（复制文字 / 引用 / 撤回）。引用发送出去的邮件本质是 **reply**：带 `In-Reply-To`、`References` 线程头和 `Re:` 主题，在邮箱里就是对该邮件的回复。撤回只对 Email Chatter 对端有效，普通邮箱客户端无法真正删除已投递的邮件。
+- **未读与邮箱状态**：见下文「邮箱已读/未读状态」。
+- **AI 标题**（可选，默认关闭）：见下文「AI 生成邮件标题」。
+
+### AI 生成邮件标题（可选，默认关闭）
+
+在 **设置 → AI 标题（可选）** 中勾选启用，然后点「下载模型」：
+
+- 默认从 `https://hf-mirror.com`（HuggingFace 镜像）下载 `Qwen/Qwen2.5-0.5B-Instruct-GGUF` 的 **Q4_K_M** 量化模型，约 **400MB**，保存到 `<程序目录>/data/models/`；也可在设置里改镜像地址或填完整模型直链。
+- 下载与推理都在**本机**完成，不上传任何内容、不需要 API Key；下载完成后可完全离线使用。
+- 启用且模型就绪后：**小输入框**发出的消息主题由模型根据正文生成（失败则回落为旧固定主题）；**扩展邮件模式**主题留空时由模型生成（失败/未就绪则回落为正文首行截断的启发式标题）。
+- 关闭该选项时保持旧行为：小输入框主题固定为 `email-chatter 消息`，扩展邮件模式主题由你填写或按正文首行生成。
+- 性能：C++ 版生成一条标题通常约数秒；Electron/Node 版纯 JS 推理较慢（约 1–2 分钟），但不会阻塞收信与界面。
+- 模型只在被启用且文件存在时加载；空闲 5 分钟自动卸载，平时不占内存。
 
 ### 常用邮箱服务器参数（在设置里填写）
 
@@ -128,10 +153,14 @@ nslookup -type=mx 你的学校域名.edu.cn
   email-chatter.exe
   libssl-3-x64.dll
   libcrypto-3-x64.dll
+  cacert.pem          TLS 根证书包（Windows 推荐随程序附带；缺失时会改用 Windows 系统证书库）
   web/                界面资源
   data/               ← 只有这里会写入
-    config.json       账户配置 + 好友白名单（含明文授权码）
-    messages.json     聊天记录
+    config.json       账户配置 + 好友白名单（含明文授权码）+ AI 设置
+    messages.json     聊天记录（含主题/引用/附件元数据/撤回状态）
+    attachments/      收发的图片与文件
+    uploads/          发送前的附件暂存（24 小时后自动清理）
+    models/           AI 标题模型（启用并下载后才有，约 400MB）
 ```
 
 - 数据跟着程序目录走：整个目录复制到 U 盘/另一台电脑，聊天记录和配置一起带走；
@@ -140,10 +169,33 @@ nslookup -type=mx 你的学校域名.edu.cn
   - 默认只使用 `<程序目录>/data` 与 `<程序目录>/web`；
   - `--data` / `--web` 若指向程序目录之外，程序会**拒绝启动**并报错；
   - 不再有 `../web`、`./web`、`%APPDATA%` 之类的回退路径；
-  - 唯一的外部读取是操作系统 TLS 根证书（建立 TLS 连接所需，属系统信任库）。
+  - 唯一的外部读取是操作系统 TLS 根证书（建立 TLS 连接所需，属系统信任库）；
+    Windows 上会加载系统证书库，也会读取程序目录的 `cacert.pem`（见下方排障）。
 - **安全提醒**：`data/config.json` 里是**明文授权码**。不要把 `data/` 上传网盘、
   发到群里或放进代码仓库（仓库已提供 `.gitignore` 排除 `data/`）；
   公用电脑上建议给程序目录设置仅本人可访问的 NTFS 权限，或使用 Windows 用户隔离。
+
+### 排障：Windows 上提示「SMTP/IMAP/POP3 问候失败」
+
+这是 **Windows 版 OpenSSL 找不到根证书**导致的典型症状，不是邮箱服务器的问题：
+
+- Linux/macOS 的 OpenSSL 默认信任路径（如 `/etc/ssl/certs`）存在，所以同一份代码在
+  Debian 上正常；Windows 上 OpenSSL 的默认路径通常是
+  `C:\Program Files\Common Files\ssl`，很多构建里这个目录**根本不存在**，于是
+  `SSL_CTX_set_default_verify_paths` 加载到 **0 个根证书** → TLS 握手报
+  `certificate verify failed` → 客户端误回退成明文连接 → 服务器不发明文欢迎语 →
+  最终显示 `问候失败`（没有具体原因，很容易误判为网络问题）。
+- **2.1.1 起已修复**：Windows 版会自动加载 **Windows 系统证书库**
+  （`CurrentUser/LocalMachine` 的 `ROOT`/`CA`）并读取程序目录的 `cacert.pem`；
+  发布包附带 `cacert.pem`，无需手动配置。
+- 自查命令：`email-chatter.exe --tls-info`，会打印 OpenSSL 版本、系统根证书数量、
+  本地 CA 文件路径与受信任根证书总数。若「受信任根证书总数」为 0，TLS 一定失败。
+- 若仍失败：把 PEM 格式的 CA 证书包命名为 `cacert.pem` 放到 exe 同目录，或设置环境变量
+  `SSL_CERT_FILE=路径\cacert.pem` 后再启动。
+- **旧版本（2.1.0 及更早）的临时解法**：运行前 `set SSL_CERT_FILE=C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt`
+  （Git for Windows 自带；或从 https://curl.se/ca/cacert.pem 下载一个），然后重新打开程序。
+- 修复后错误信息也会带上真实 TLS 原因（例如 `原 TLS 失败原因：...certificate verify failed...`），
+  不再只显示裸「问候失败」。
 
 ---
 
@@ -196,8 +248,9 @@ npm run dist:linux   # 打包 Linux AppImage
 
 Electron 版数据目录同样在**程序目录**下的 `data/`（便携式，不写用户目录、不写注册表）：
 - 默认 `<程序目录>/data/`
-- 若程序装在不可写目录（如 `C:\Program Files`），会退回 `%APPDATA%/Email Chatter/data/` 并在控制台提示；
-  绿色便携使用时建议放在可写目录，或用 `--data <目录>` 显式指定。
+- 程序目录必须可写；若装在不可写目录（如 `C:\Program Files`）会**直接报错退出**，
+  请换到可写目录，或用 `--data <程序目录内可写子目录>` 显式指定（不会写 `%APPDATA%`）；
+  绿色便携使用时建议放在可写目录。
 - 与 C++ 版格式完全一致（`config.json` + `messages.json`），可互相迁移。
 
 ---
@@ -205,9 +258,25 @@ Electron 版数据目录同样在**程序目录**下的 `data/`（便携式，�
 ## 好友白名单机制
 
 - 只有加入白名单的邮箱地址，其来信才会被客户端下载、解析、显示，并计数未读；
-- 来自其它地址的邮件会被跳过（不会删服务器上的邮件，只是客户端不处理）；
-- 删除好友会同时清除其会话与未读记录；
+- 来自其它地址的邮件会被跳过：**客户端不会删除、移动或改动它们在邮箱里的任何状态**，也不会把它们标成已读；
+- 删除好友会清除本客户端的会话与未读记录；**邮箱里的邮件不会被删除**，未读的邮件也不会被标成已读；
 - 建议双方互相添加对方为白名单好友，即可互通消息。
+
+## 邮箱已读/未读状态
+
+（IMAP 模式；POP3 协议本身没有已读标志，无法控制邮箱里的已读状态，见「已知限制」）
+
+| 情况 | 邮箱里的状态 |
+|---|---|
+| 非好友发来的邮件 | **永远保持未读**（客户端只用 `BODY.PEEK[]` 读取并跳过，不设置 `\Seen`，不删除不移动） |
+| 好友发来的新邮件 | 拉取后**仍是未读**（聊天里计未读）；你打开该好友会话后，客户端才把这些邮件的 IMAP UID 批量标为已读 |
+| 好友邮件在聊天里已读 | 打开会话时同步标为已读 |
+| 删除好友 | 邮箱邮件完全不受影响；聊天里未读的邮件在邮箱里仍是未读 |
+| 超过 50MB 的邮件 | 跳过下载，邮箱状态不变（仍按未读留在邮箱） |
+
+> 实现：IMAP 收信使用 `UID FETCH <uid> (BODY.PEEK[])`，避免 `BODY[]`/`RFC822` 隐式置已读；
+> 只有打开好友会话时才对该会话内、已记录的 IMAP UID 发送 `UID STORE +FLAGS.SILENT (\Seen)`。
+> 2.1 之前版本曾在拉取时误标已读，本版本不会批量恢复历史邮件的未读状态（避免影响你在其它客户端的状态）。
 
 ## 测试
 
@@ -215,35 +284,68 @@ Electron 版数据目录同样在**程序目录**下的 `data/`（便携式，�
 
 ```bash
 # C++ 客户端端到端测试（Windows 下默认找 build/Release/email-chatter.exe）
-python tests/e2e_test.py
+python tests/e2e_test.py                 # 可用 --only J,K,L,M,N 只跑新功能场景
+python tests/e2e_test.py --base-port 57500   # 端口冲突时换一组端口
 
 # Node (Electron) 后端端到端测试（需要 Node ≥ 18）
-node tests/e2e_node.js
+node tests/e2e_node.js                   # 支持 EC_SMTP/EC_POP3/EC_IMAP/EC_CONTROL/EC_API 覆盖端口
 ```
 
 覆盖：HTTP API、账户配置、好友增删、SMTP 发送、POP3/IMAP 收信、中文正文解码、
-白名单过滤、未读计数、已读标记、静态资源（PWA）等。
+白名单过滤、未读计数、已读标记、静态资源（PWA），以及 2.0 新增的：
+扩展邮件模式的 MIME/主题/抄送密送、附件与图片收发及 `/api/attachment` 下载、
+引用头与引用正文块、撤回邮件与 `pending_recalls`、AI 状态/配置/未就绪启发式回落/
+下载重定向与取消（本地 stub 服务器），旧版数据文件兼容。
+2.1 新增：IMAP `BODY.PEEK[]` 不误标已读、非好友邮件保持未读、打开会话才批量标已读、
+删除好友不影响邮箱、引用发送为 reply（`Re:` / `In-Reply-To` / `References`）等内容
+（C++ 160 项 / Node 92 项断言）。
+
+AI 引擎另有独立对照工具（需要本机有 llama.cpp / 模型，属开发验证用）：
+
+```bash
+python tools/ai_compare.py --engine cpp --cpp-exe build/Release/ai-selftest.exe
+python tools/ai_compare.py --engine node
+```
+
+Windows 上可单独跑 TLS 根证书/连接排障回归（自带测试证书，无需外网）：
+
+```bat
+python tests\tls_ca_test.py
+email-chatter.exe --tls-info
+```
 
 ## 安全与隐私
 
 - HTTP 服务默认只监听 `127.0.0.1`，不对外网开放（`--host 0.0.0.0` 可放开，慎用）；
-- **CSRF / DNS-rebinding 防护**：`/api/*` 请求会校验 `Host`（必须是 127.0.0.1/localhost/[::1]）
-  与 `Origin`（若浏览器带 Origin，其主机必须与 Host 一致），恶意网页无法冒用本机服务读写配置或发信；
+- **CSRF / DNS-rebinding 防护**：默认只绑定回环地址时，`/api/*` 请求会校验 `Host`
+  （必须是 127.0.0.1/localhost/[::1]）；任何情况下若浏览器带 `Origin`，其主机必须与 `Host` 一致。
+  恶意网页无法冒用本机服务读写配置或发信。（显式 `--host 0.0.0.0` 开放局域网时，Host 白名单
+  不再适用，仅保留 Origin 一致性校验——此时本机服务也可能被同网段直接访问，请自行加防火墙。）
 - TLS 连接校验服务器证书与**主机名**（`SSL_VERIFY_PEER` + 证书 SAN/CN 匹配，同时校验 SNI）；
 - 客户端授权密码以**明文**保存在本机 `data/config.json`（仅限本机可读），不要分享该文件；
+- **附件与图片**只保存在本机 `data/attachments/`，`/api/attachment` 只允许读取该目录下的文件名
+  （拒绝路径穿越），不会把任意本地文件暴露给网页；
+- **AI 标题**完全本地推理：模型从你配置的 HuggingFace 镜像下载后保存在 `data/models/`，
+  消息正文不会发送到任何服务器；默认下载 URL 为 HTTPS 并校验证书，若你把镜像/直链改成 `http://`
+  或服务器重定向到明文 HTTP，则下载不再加密（不建议）。
 - 不要把演示用的 mock 服务器（tests/mock_mail.py）暴露到公网。
 
 ## 目录结构
 
 ```
 src/            C++ 实现：util(JSON/base64/字符集) mime SMTP/POP3/IMAP http app main
+  ai.*          AI 标题管理：HF 镜像下载、状态、启发式/模型标题
+  gguf.*        自研最小 GGUF + Qwen2 推理引擎（Q4_K/Q6_K/Q8_0/F16/BF16/F32）
 web/            微信风格前端（同一套 UI 供 C++ / PWA / Electron 使用）
   manifest.json  PWA 清单
   sw.js          Service Worker（离线壳缓存，绝不缓存 /api）
   icons/        PWA 图标（tools/make_icons.py 生成）
-electron/       Electron 打包工程 + 纯 Node 后端
+electron/       Electron 打包工程 + 纯 Node 后端（backend.js）
+  ai.js         Node 版 AI 标题管理（worker 线程推理、下载、状态）
+  ai-worker.js  Node 推理 worker
+  gguf.js       Node 版 GGUF/Qwen2 引擎
 tests/          mock_mail.py 模拟邮件服务器；e2e_test.py / e2e_node.js 端到端测试
-tools/          make_icons.py 图标生成脚本
+tools/          make_icons.py、ref_llama.py / ai_compare.py（AI 引擎与 llama.cpp 对照）、ai-selftest
 ```
 
 ## 发布包（release/）
@@ -287,9 +389,22 @@ npm run dist:win        :: → dist\Email Chatter Setup 1.0.0.exe
   设置里可关闭「自动收信」，仅保留手动「立即收信」按钮；
 - 单轮最多拉取约 300 封新邮件，超出部分下一轮继续，避免一次拉爆内存；
 - POP3 模式不会删除服务器上的邮件（避免误删），邮箱容量请自行在网页端管理；
-- 每条消息正文上限 4000 字符，每个会话保留最近 300 条；
-- 图片/附件不在客户端显示（可在邮箱官网查看）；
-- 发送的每一条消息就是一封邮件，主题固定为“email-chatter 消息”，可在邮箱中追溯。
+- 每条消息正文上限：聊天 4000 字符、邮件模式 16000 字符；每个会话保留最近 300 条；
+- 附件限制：单个 ≤ 16MB、合计 ≤ 24MB（多数邮箱服务商本身也限制在 25MB 左右）；
+- 撤回只在双方都用 Email Chatter 时有效：对端客户端收到撤回通知后隐藏该消息；
+  普通邮箱客户端里的原邮件**无法真正删除**，请勿用它发送敏感信息；
+- 引用消息发送的邮件是标准 reply（`In-Reply-To`/`References`/`Re:` 主题）；如果被引用的旧消息没有
+  记录 `Message-ID`（2.0 之前的历史消息），则只带引用卡片和可读引用块，不会伪造线程头；
+- 引用/撤回依赖邮件 `Message-ID`：2.0 之前发出的旧消息没有记录 Message-ID，
+  对旧消息只能引用、不能撤回；
+- **邮箱已读状态**：IMAP 模式下非好友邮件永远保持未读；好友邮件在打开会话时才标已读（见上文表格）。
+  POP3 没有已读标志，无法控制邮箱里的已读/未读，也不会删除服务器邮件；
+- AI 标题默认关闭；下载模型需要能访问你配置的 HuggingFace 镜像（默认 hf-mirror.com），
+  首次下载约 400MB；Electron/Node 版纯 JS 推理较慢（约 1–2 分钟/条）；
+- 无 OpenSSL 的构建（如部分 Linux 发行版默认）无法建立 TLS/SSL 连接，
+  也无法下载 AI 模型，但仍可使用本地聊天/附件功能；
+- 小输入框发出的聊天消息主题在关闭 AI 时仍是固定的 `email-chatter 消息`（引用发送时会加 `Re:` 前缀）。
+  如果要让邮件在邮箱里更像普通邮件，请使用扩展邮件模式（自定主题）或启用 AI 标题。
 
 ## 许可证
 

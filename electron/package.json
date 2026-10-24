@@ -27,6 +27,9 @@
     "files": [
       "main.js",
       "backend.js",
+      "ai.js",
+      "ai-worker.js",
+      "gguf.js",
       "web/**/*",
       "package.json"
     ],

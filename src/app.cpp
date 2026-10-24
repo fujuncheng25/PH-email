@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <system_error>
 
@@ -25,7 +26,7 @@ namespace app {
 namespace {
 
 bool file_exists(const std::string& path) {
-  std::ifstream f(path);
+  std::ifstream f(path, std::ios::binary);
   return f.good();
 }
 
@@ -50,11 +51,13 @@ bool write_file(const std::string& path, const std::string& content) {
   return std::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
-std::string truncate_utf8(const std::string& s, size_t max_bytes) {
-  if (s.size() <= max_bytes) return s;
-  size_t n = max_bytes;
-  while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) --n;
-  return s.substr(0, n);
+bool read_bytes(const std::string& path, std::string& out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  out = ss.str();
+  return true;
 }
 
 std::string jstr(const util::Json& o, const char* k, const std::string& def = "") {
@@ -64,6 +67,10 @@ std::string jstr(const util::Json& o, const char* k, const std::string& def = ""
 int jint(const util::Json& o, const char* k, int def) {
   const util::Json* v = o.get(k);
   return v ? (int)v->as_int64(def) : def;
+}
+int64_t jint64(const util::Json& o, const char* k, int64_t def) {
+  const util::Json* v = o.get(k);
+  return v ? v->as_int64(def) : def;
 }
 bool jbool(const util::Json& o, const char* k, bool def) {
   const util::Json* v = o.get(k);
@@ -81,6 +88,15 @@ std::string json_err(const std::string& msg) {
   r["ok"] = util::Json::make_bool(false);
   r["error"] = util::Json::make_string(msg);
   return r.dump();
+}
+
+std::string random_hex(size_t n) {
+  // thread_local：/api/upload 等会被多个 HTTP 连接线程并发调用，静态 rng 有数据竞争
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  static const char* hexd = "0123456789abcdef";
+  std::string out;
+  for (size_t i = 0; i < n; ++i) out += hexd[rng() & 15];
+  return out;
 }
 
 std::string url_decode(const std::string& s) {
@@ -124,6 +140,130 @@ std::string query_param(const std::string& query, const std::string& name) {
   return "";
 }
 
+// /api/state 顶层 ai、/api/ai/status 的 ai 对象（FEATURE-SPEC §4.6）
+util::Json json_ai_status(const ai::Status& st) {
+  util::Json j = util::Json::make_object();
+  j["enabled"] = util::Json::make_bool(st.enabled);
+  j["model_ready"] = util::Json::make_bool(st.model_ready);
+  j["downloading"] = util::Json::make_bool(st.downloading);
+  j["downloaded_bytes"] = util::Json::make_number((double)st.downloaded_bytes);
+  j["total_bytes"] = util::Json::make_number((double)st.total_bytes);
+  int percent = 0;
+  if (st.total_bytes > 0) {
+    long long p = st.downloaded_bytes * 100 / st.total_bytes;
+    if (p < 0) p = 0;
+    if (p > 100) p = 100;
+    percent = (int)p;
+  } else if (st.model_ready) {
+    percent = 100;
+  }
+  j["percent"] = util::Json::make_number(percent);
+  j["error"] = util::Json::make_string(st.error);
+  j["model_file"] = util::Json::make_string(
+      st.model_file.empty() ? "qwen2.5-0.5b-instruct-q4_k_m.gguf" : st.model_file);
+  j["mirror"] = util::Json::make_string(st.mirror.empty() ? "https://hf-mirror.com" : st.mirror);
+  j["busy"] = util::Json::make_bool(st.busy);
+  j["engine"] = util::Json::make_string(
+      st.engine.empty() ? "qwen2.5-0.5b-instruct-q4_k_m" : st.engine);
+  return j;
+}
+
+// 消息附件 → /api/messages 里的对象（§2：含 url/inline）
+util::Json attachment_json(const mime::Attachment& a) {
+  util::Json o = util::Json::make_object();
+  o["name"] = util::Json::make_string(a.name);
+  o["mime"] = util::Json::make_string(a.mime.empty() ? "application/octet-stream" : a.mime);
+  o["size"] = util::Json::make_number((double)a.size);
+  o["file"] = util::Json::make_string(a.file);
+  o["url"] = util::Json::make_string(a.file.empty()
+                                         ? ""
+                                         : "/api/attachment?file=" + util::url_encode_component(a.file));
+  o["inline"] = util::Json::make_bool(a.inline_);
+  return o;
+}
+
+// 收件人列表解析：逗号/分号/空白分隔，去空、去重、必须含 @，每类最多 max_count 个。
+void parse_addr_list(const std::string& raw, size_t max_count, std::vector<std::string>& out) {
+  const size_t start = out.size();
+  std::string cur;
+  auto flush = [&]() {
+    std::string e = util::to_lower(util::trim(cur));
+    cur.clear();
+    if (e.empty()) return;
+    if (out.size() - start >= max_count) return;
+    if (e.size() >= 2 && e.front() == '<' && e.back() == '>') e = e.substr(1, e.size() - 2);
+    if (e.find('@') == std::string::npos) return;
+    for (const auto& x : out) {
+      if (x == e) return;
+    }
+    out.push_back(e);
+  };
+  for (char c : raw) {
+    if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\r' || c == '\n') flush();
+    else cur += c;
+  }
+  flush();
+}
+
+// data/attachments 下文件名的安全分量：只保留 [A-Za-z0-9._-] 与中文，去路径分隔符；
+// 截断到 60 字符时保留扩展名（避免长文件名把 .png 切掉导致 Content-Type 错误）。
+std::string sanitize_stored_component(const std::string& name) {
+  std::string out;
+  for (unsigned char c : util::trim(name)) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' ||
+        c == '_' || c == '-' || c >= 0x80) {
+      out += (char)c;
+    } else {
+      out += '_';
+    }
+  }
+  while (!out.empty() && out.front() == '.') out.erase(out.begin());
+  if (out.empty()) out = "file";
+  constexpr size_t kMaxChars = 60;
+  if (util::utf8_chars(out) <= kMaxChars) return out;
+  // 拆出扩展名（最多 12 字节，且不能是纯 "."），只截断主名，最后补回扩展名
+  std::string ext;
+  auto dot = out.rfind('.');
+  if (dot != std::string::npos && dot > 0 && out.size() - dot <= 12) ext = out.substr(dot);
+  const size_t ext_chars = util::utf8_chars(ext);
+  const size_t stem_max = kMaxChars > ext_chars ? kMaxChars - ext_chars : 1;
+  std::string stem = ext.empty() ? out : out.substr(0, out.size() - ext.size());
+  stem = util::truncate_utf8_chars(stem, stem_max);
+  if (stem.empty()) stem = "file";
+  return stem + ext;
+}
+
+// 把附件字节写入 data/attachments/，生成 <epoch>-<4hex>-<sanitized-name>（重名追加序号）。
+bool write_attachment_file(const std::string& dir, const std::string& original,
+                           const std::string& data, std::string& out_file) {
+  if (!ensure_dir(dir)) return false;
+  const std::string safe = sanitize_stored_component(original);
+  const std::string base = std::to_string(util::now_epoch()) + "-" + random_hex(4) + "-" + safe;
+  std::string name = base;
+  int n = 1;
+  while (file_exists(dir + "/" + name)) name = base + "-" + std::to_string(n++);
+  if (!write_file(dir + "/" + name, data)) return false;
+  out_file = name;
+  return true;
+}
+
+std::string base_mime(const std::string& mime) {
+  std::string m = util::to_lower(util::trim(mime));
+  auto semi = m.find(';');
+  if (semi != std::string::npos) m = util::trim(m.substr(0, semi));
+  if (m.empty() || m.find('/') == std::string::npos) return "application/octet-stream";
+  return m;
+}
+
+std::string join_addrs(const std::vector<std::string>& list) {
+  std::string out;
+  for (size_t i = 0; i < list.size(); ++i) {
+    if (i) out += ", ";
+    out += list[i];
+  }
+  return out;
+}
+
 } // namespace
 
 // ============================== Store ==============================
@@ -139,6 +279,7 @@ bool Store::load(std::string& err) {
   unread.clear();
   seen_pop3.clear();
   seen_imap.clear();
+  pending_recalls.clear();
   next_msg_id = 1;
 
   const std::string cpath = config_path_of(data_dir);
@@ -160,6 +301,15 @@ bool Store::load(std::string& err) {
     account.poll_interval = jint(cfg, "poll_interval", 8);
     if (account.poll_interval < 3) account.poll_interval = 3;
     account.auto_poll = jbool(cfg, "auto_poll", true);
+
+    if (const util::Json* ai_cfg = cfg.get("ai"); ai_cfg && ai_cfg->is_object()) {
+      account.ai.enabled = jbool(*ai_cfg, "enabled", false);
+      std::string mirror = util::trim(jstr(*ai_cfg, "mirror"));
+      account.ai.mirror = mirror.empty() ? "https://hf-mirror.com" : mirror;
+      account.ai.model_url = util::sanitize_header(util::trim(jstr(*ai_cfg, "model_url")));
+      std::string mf = mime::sanitize_filename(util::trim(jstr(*ai_cfg, "model_file")), 120);
+      account.ai.model_file = (mf.empty() || mf == "file") ? "qwen2.5-0.5b-instruct-q4_k_m.gguf" : mf;
+    }
 
     if (const util::Json* im = cfg.get("imap")) {
       int p = jint(*im, "port", 993);
@@ -196,10 +346,16 @@ bool Store::load(std::string& err) {
     if (const util::Json* si = cfg.get("seen_imap"); si && si->is_array()) {
       for (const auto& item : si->arr) seen_imap.insert(item.as_string());
     }
+    if (const util::Json* pr = cfg.get("pending_recalls"); pr && pr->is_array()) {
+      for (const auto& item : pr->arr) {
+        std::string mid = util::trim(item.as_string());
+        if (!mid.empty()) pending_recalls.insert(mid);
+      }
+    }
     if (const util::Json* un = cfg.get("unread"); un && un->is_object()) {
       for (const auto& kv : un->obj) unread[kv.first] = (int)kv.second.as_int64(0);
     }
-    next_msg_id = jint(cfg, "next_msg_id", 1);
+    next_msg_id = jint64(cfg, "next_msg_id", 1);
     if (next_msg_id < 1) next_msg_id = 1;
   }
 
@@ -212,11 +368,35 @@ bool Store::load(std::string& err) {
         std::vector<Message> list;
         for (const auto& item : kv.second.arr) {
           Message m;
-          m.id = item.get("id") ? item.get("id")->as_int64(0) : 0;
+          m.id = jint64(item, "id", 0);
           m.dir = jstr(item, "dir");
+          m.kind = util::to_lower(util::trim(jstr(item, "kind", "chat")));
+          if (m.kind != "email") m.kind = "chat";
           m.text = jstr(item, "text");
-          m.ts = item.get("ts") ? item.get("ts")->as_int64(0) : 0;
+          m.subject = jstr(item, "subject");
+          m.ts = jint64(item, "ts", 0);
           m.mid = jstr(item, "mid");
+          m.uid = jstr(item, "uid");
+          m.recalled = jbool(item, "recalled", false);
+          if (const util::Json* q = item.get("quote"); q && q->is_object()) {
+            m.has_quote = true;
+            m.quote.text = util::truncate_utf8_chars(jstr(*q, "text"), 500);
+            m.quote.from = jstr(*q, "from");
+            m.quote.ts = jint64(*q, "ts", 0);
+            m.quote.mid = jstr(*q, "mid");
+          }
+          if (const util::Json* at = item.get("attachments"); at && at->is_array()) {
+            for (const auto& ai : at->arr) {
+              if (!ai.is_object()) continue;
+              mime::Attachment a;
+              a.name = jstr(ai, "name");
+              a.mime = jstr(ai, "mime", "application/octet-stream");
+              a.size = jint64(ai, "size", 0);
+              a.file = jstr(ai, "file");
+              a.inline_ = jbool(ai, "inline", mime::is_image_mime(a.mime));
+              m.attachments.push_back(a);
+            }
+          }
           list.push_back(m);
         }
         if (!list.empty()) conversations[kv.first] = list;
@@ -254,6 +434,16 @@ bool Store::save_config(std::string& err) {
   sm["ssl"] = util::Json::make_bool(account.smtp.ssl);
   cfg["smtp"] = sm;
 
+  util::Json aic = util::Json::make_object();
+  aic["enabled"] = util::Json::make_bool(account.ai.enabled);
+  aic["mirror"] = util::Json::make_string(account.ai.mirror.empty() ? "https://hf-mirror.com"
+                                                                    : account.ai.mirror);
+  aic["model_url"] = util::Json::make_string(account.ai.model_url);
+  aic["model_file"] = util::Json::make_string(account.ai.model_file.empty()
+                                                  ? "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+                                                  : account.ai.model_file);
+  cfg["ai"] = aic;
+
   util::Json fr = util::Json::make_array();
   for (const auto& f : friends) {
     util::Json item = util::Json::make_object();
@@ -272,6 +462,10 @@ bool Store::save_config(std::string& err) {
   util::Json si = util::Json::make_array();
   for (const auto& k : seen_imap) si.arr.push_back(util::Json::make_string(k));
   cfg["seen_imap"] = si;
+
+  util::Json pr = util::Json::make_array();
+  for (const auto& k : pending_recalls) pr.arr.push_back(util::Json::make_string(k));
+  cfg["pending_recalls"] = pr;
 
   util::Json un = util::Json::make_object();
   for (const auto& kv : unread) un[kv.first] = util::Json::make_number(kv.second);
@@ -295,9 +489,34 @@ bool Store::save_messages(std::string& err) {
       util::Json item = util::Json::make_object();
       item["id"] = util::Json::make_number((double)m.id);
       item["dir"] = util::Json::make_string(m.dir);
+      item["kind"] = util::Json::make_string(m.kind.empty() ? "chat" : m.kind);
       item["text"] = util::Json::make_string(m.text);
+      if (!m.subject.empty()) item["subject"] = util::Json::make_string(m.subject);
       item["ts"] = util::Json::make_number((double)m.ts);
       if (!m.mid.empty()) item["mid"] = util::Json::make_string(m.mid);
+      if (!m.uid.empty()) item["uid"] = util::Json::make_string(m.uid);
+      if (m.recalled) item["recalled"] = util::Json::make_bool(true);
+      if (m.has_quote) {
+        util::Json q = util::Json::make_object();
+        q["text"] = util::Json::make_string(m.quote.text);
+        q["from"] = util::Json::make_string(m.quote.from);
+        q["ts"] = util::Json::make_number((double)m.quote.ts);
+        q["mid"] = util::Json::make_string(m.quote.mid);
+        item["quote"] = q;
+      }
+      if (!m.attachments.empty()) {
+        util::Json ats = util::Json::make_array();
+        for (const auto& a : m.attachments) {
+          util::Json o = util::Json::make_object();
+          o["name"] = util::Json::make_string(a.name);
+          o["mime"] = util::Json::make_string(a.mime);
+          o["size"] = util::Json::make_number((double)a.size);
+          o["file"] = util::Json::make_string(a.file);
+          o["inline"] = util::Json::make_bool(a.inline_);
+          ats.arr.push_back(o);
+        }
+        item["attachments"] = ats;
+      }
       arr.arr.push_back(item);
     }
     convs[kv.first] = arr;
@@ -361,35 +580,73 @@ bool Store::remove_friend(const std::string& email) {
   }
   return false;
 }
-bool Store::add_message(const std::string& peer, const std::string& dir, const std::string& text, int64_t ts,
-                        const std::string& mid) {
-  std::string t = truncate_utf8(util::trim(text), 4000);
-  if (t.empty()) t = "(空消息)";
+
+bool Store::add_message(const std::string& peer, Message m, int64_t* out_id) {
   // 收件按 Message-ID 去重：POP3 的 seen 表清空/损坏/换机重拉时，
   // 同一封邮件（同 Message-ID）不应在对话里出现两次。
-  if (dir == "in" && !mid.empty()) {
+  if (m.dir == "in" && !m.mid.empty()) {
     auto& conv = conversations[peer];
-    for (const auto& m : conv) {
-      if (m.dir == "in" && !m.mid.empty() && m.mid == mid) return false;
+    for (const auto& x : conv) {
+      if (x.dir == "in" && !x.mid.empty() && x.mid == m.mid) return false;
     }
+    // 已被撤回：今后收到该 mid 的来信直接丢弃（FEATURE-SPEC §4.4）
+    if (pending_recalls.count(m.mid) != 0) return false;
   }
-  Message m;
-  m.id = next_msg_id++;
-  m.dir = dir;
+  m.kind = (m.kind == "email") ? "email" : "chat";
+  const size_t max_chars = (m.kind == "email") ? 16000 : 4000;
+  std::string t = util::trim(m.text);
+  if (!t.empty()) t = util::truncate_utf8_chars(t, max_chars);
+  // 附件/引用消息允许正文为空（不要用 "(空消息)" 覆盖附件消息）
+  if (t.empty() && m.attachments.empty() && !m.has_quote) t = "(空消息)";
   m.text = t;
-  m.ts = ts > 0 ? ts : util::now_epoch();
-  m.mid = mid;
+  m.id = next_msg_id++;
+  if (m.ts <= 0) m.ts = util::now_epoch();
   auto& conv = conversations[peer];
-  conv.push_back(m);
+  conv.push_back(std::move(m));
+  if (out_id) *out_id = conv.back().id;
   if (conv.size() > 300) conv.erase(conv.begin(), conv.begin() + (long)(conv.size() - 300));
   return true;
 }
+
+bool Store::add_message(const std::string& peer, const std::string& dir, const std::string& text,
+                        int64_t ts, const std::string& mid, const std::string& kind) {
+  Message m;
+  m.dir = dir;
+  m.text = text;
+  m.ts = ts;
+  m.mid = mid;
+  m.kind = kind;
+  return add_message(peer, std::move(m), nullptr);
+}
+
 void Store::mark_read(const std::string& peer) { unread.erase(peer); }
+
 std::string Store::last_text(const std::string& peer) const {
   auto it = conversations.find(peer);
   if (it == conversations.end() || it->second.empty()) return "";
-  return it->second.back().text;
+  const Message& m = it->second.back();
+  if (m.recalled) return "[已撤回]";
+  bool has_image = false, has_other = false;
+  std::string other_name;
+  for (const auto& a : m.attachments) {
+    if (a.inline_) {
+      has_image = true;
+    } else {
+      has_other = true;
+      if (other_name.empty()) other_name = a.name;
+    }
+  }
+  if (has_image) return "[图片]";
+  if (has_other) return "[文件] " + other_name;
+  if (m.kind == "email" && !m.subject.empty()) return m.subject;
+  std::string first = m.text;
+  auto nl = first.find('\n');
+  if (nl != std::string::npos) first = first.substr(0, nl);
+  first = util::trim(first);
+  if (!first.empty()) return first;
+  return util::trim(m.text);
 }
+
 int64_t Store::last_ts(const std::string& peer) const {
   auto it = conversations.find(peer);
   if (it == conversations.end() || it->second.empty()) return 0;
@@ -415,12 +672,36 @@ bool App::init(const std::string& data_dir, const std::string& web_dir, const st
     err = lerr;
     return false;
   }
+  // 启动时创建附件/上传/模型目录，并清理超 24h 的暂存上传
+  ensure_dir(data_dir + "/attachments");
+  ensure_dir(data_dir + "/uploads");
+  ensure_dir(data_dir + "/models");
+  cleanup_uploads();
+  ai::manager().init(data_dir);
+  ai::manager().set_config(store.account.ai);
+
   std::string herr;
   if (!http::listen(bind_host, port, listen_fd, port_, herr)) {
     err = herr;
     return false;
   }
   return true;
+}
+
+void App::cleanup_uploads() {
+  const std::string dir = store.data_dir + "/uploads";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  auto now = std::filesystem::file_time_type::clock::now();
+  for (auto it = std::filesystem::directory_iterator(dir, ec);
+       !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+    std::error_code fec;
+    if (!it->is_regular_file(fec)) continue;
+    auto ft = it->last_write_time(fec);
+    if (fec) continue;
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(now - ft).count();
+    if (age > 24LL * 3600) std::filesystem::remove(it->path(), fec);
+  }
 }
 
 void App::start_threads() {
@@ -477,6 +758,8 @@ void App::run_poller() {
     if (!running) break;
     std::string err;
     poll_once(err);
+    // 空闲 5 分钟后卸载模型内存（FEATURE-SPEC §6.2）
+    ai::manager().idle_tick();
   }
 }
 
@@ -486,6 +769,7 @@ bool App::poll_once(std::string& err) {
   proto::Pop3Config pc;
   std::string mode, email, pass;
   std::set<std::string> seen_p, seen_i;
+  std::set<std::string> pending_seen;
   {
     std::lock_guard lk(mtx);
     ic = store.account.imap;
@@ -495,6 +779,7 @@ bool App::poll_once(std::string& err) {
     pass = store.account.password;
     seen_p = store.seen_pop3;
     seen_i = store.seen_imap;
+    pending_seen = pending_seen_imap;  // 2.1：打开会话待标已读的 UID
   }
   ic.user = ic.pass = "";
   pc.user = pc.pass = "";
@@ -533,51 +818,144 @@ bool App::poll_once(std::string& err) {
   } else {
     ic.user = email;
     ic.pass = pass;
-    fr = proto::imap_fetch(ic, seen_i);
+    // 2.1：收信用 BODY.PEEK[]（不自动置已读）；只有打开会话收集的 UID 才批量标 \Seen。
+    fr = proto::imap_fetch(ic, seen_i, 300, pending_seen);
+    // 成功标记的 uid 从 pending 移除；失败的保留，下次轮询重试。
+    if (!fr.seen_marked.empty()) {
+      std::lock_guard lk(mtx);
+      for (const auto& u : fr.seen_marked) pending_seen_imap.erase(u);
+    }
   }
 
   int fetched = 0, skipped = 0;
   if (fr.ok) {
     bool seen_changed = false;
-    std::lock_guard lk(mtx);
-    for (const auto& m : fr.messages) {
-      if (m.from_addr.empty() || m.from_addr == email) { skipped++; continue; }
-      if (!store.is_friend(m.from_addr)) { skipped++; continue; }
-      if (store.add_message(m.from_addr, "in", m.body_text, m.date_epoch, m.message_id)) {
-        store.unread[m.from_addr] += 1;
-        fetched++;
+    bool recall_state_changed = false;    // 有消息被置为撤回（写 messages.json）
+    bool pending_recalls_changed = false; // 新增 pending_recalls（写 config.json）
+    const std::string att_dir = store.data_dir + "/attachments";
+
+    struct Pending {
+      std::string peer;
+      std::vector<mime::Attachment> atts;  // 从 fr.messages 移出，避免整封 raw 复制
+      Message msg;
+    };
+    std::vector<Pending> pending;
+
+    // 第一阶段（持锁）：过滤白名单、处理撤回通知、按 mid 去重预检
+    {
+      std::lock_guard lk(mtx);
+      for (auto& m : fr.messages) {
+        if (m.from_addr.empty() || m.from_addr == email) { skipped++; continue; }
+        if (!store.is_friend(m.from_addr)) { skipped++; continue; }
+        if (!m.recall_mid.empty() || m.kind == "recall") {
+          // 撤回通知：不生成聊天消息
+          if (!m.recall_mid.empty()) {
+            auto it = store.conversations.find(m.from_addr);
+            bool found = false;
+            if (it != store.conversations.end()) {
+              for (auto& x : it->second) {
+                if (x.dir == "in" && !x.mid.empty() && x.mid == m.recall_mid) {
+                  found = true;
+                  x.recalled = true;  // 不改顺序、不改变未读
+                  break;
+                }
+              }
+            }
+            if (found) {
+              recall_state_changed = true;
+            } else if (store.pending_recalls.insert(m.recall_mid).second) {
+              pending_recalls_changed = true;
+            }
+          }
+          continue;
+        }
+        Pending p;
+        p.peer = m.from_addr;
+        p.msg.dir = "in";
+        p.msg.kind = (m.kind == "email") ? "email" : "chat";
+        p.msg.text = m.body_text;
+        p.msg.subject = util::truncate_utf8_chars(util::sanitize_header(m.subject), 200);
+        p.msg.ts = m.date_epoch;
+        p.msg.mid = m.message_id;
+        p.msg.uid = m.uid;  // 2.1：记录 IMAP UID（POP3 为空）
+        if (m.has_quote) {
+          p.msg.has_quote = true;
+          p.msg.quote = m.quote;
+        }
+        // 只移动附件数据，不再复制整封 mime::Msg（raw/正文/附件 data 均不重复持有）
+        p.atts = std::move(m.attachments);
+        m.body_text.clear();
+        pending.push_back(std::move(p));
+      }
+    }
+
+    // 第二阶段（锁外）：附件落盘（大文件写入不阻塞 HTTP API）
+    int write_failed = 0;
+    for (auto& p : pending) {
+      for (auto& a : p.atts) {
+        std::string fname;
+        if (write_attachment_file(att_dir, a.name, a.data, fname)) {
+          a.file = fname;
+          a.size = (long long)a.data.size();
+          a.data.clear();
+          a.data.shrink_to_fit();
+          p.msg.attachments.push_back(std::move(a));
+        } else {
+          write_failed++;
+        }
+      }
+      p.atts.clear();
+    }
+
+    // 第三阶段（持锁）：写消息、更新未读与 seen 表
+    {
+      std::lock_guard lk(mtx);
+      for (auto& p : pending) {
+        // 先记录已落盘附件名：add_message 返回 false（重复 mid / pending_recalls）时要删掉，
+        // 否则这些文件永远不被引用（孤儿文件，磁盘无上限增长）。
+        std::vector<std::string> files;
+        files.reserve(p.msg.attachments.size());
+        for (const auto& a : p.msg.attachments) files.push_back(a.file);
+        if (store.add_message(p.peer, std::move(p.msg))) {
+          store.unread[p.peer] += 1;
+          fetched++;
+        } else {
+          skipped++;
+          for (const auto& f : files) {
+            if (!f.empty()) std::remove((att_dir + "/" + f).c_str());
+          }
+        }
+      }
+      skipped += write_failed;
+      if (use_pop3) {
+        for (const auto& k : fr.new_keys) { store.seen_pop3.insert(k); seen_changed = true; }
+        // seen 表超过阈值时裁掉最旧一半而不是整体清空：
+        // 整体清空会让 POP3 用户把所有历史邮件重拉一遍，对话被重复消息灌满
+        while (store.seen_pop3.size() > 5000) {
+          auto it = store.seen_pop3.begin();
+          std::advance(it, (long)(store.seen_pop3.size() / 2));
+          store.seen_pop3.erase(store.seen_pop3.begin(), it);
+          seen_changed = true;
+        }
       } else {
-        skipped++;
+        for (const auto& k : fr.new_keys) { store.seen_imap.insert(k); seen_changed = true; }
+        while (store.seen_imap.size() > 5000) {
+          auto it = store.seen_imap.begin();
+          std::advance(it, (long)(store.seen_imap.size() / 2));
+          store.seen_imap.erase(store.seen_imap.begin(), it);
+          seen_changed = true;
+        }
       }
+      std::string serr;
+      if (fetched > 0 || recall_state_changed) store.save_messages(serr);
+      // 只在真正有变化时才写配置，避免每 8 秒无条件磁盘写入
+      if (seen_changed || fetched > 0 || pending_recalls_changed) store.save_config(serr);
+      poll_status.last_ts = util::now_epoch();
+      poll_status.ok = true;
+      poll_status.error.clear();
+      poll_status.fetched = fetched;
+      poll_status.skipped = skipped;
     }
-    if (use_pop3) {
-      for (const auto& k : fr.new_keys) { store.seen_pop3.insert(k); seen_changed = true; }
-      // seen 表超过阈值时裁掉最旧一半而不是整体清空：
-      // 整体清空会让 POP3 用户把所有历史邮件重拉一遍，对话被重复消息灌满
-      while (store.seen_pop3.size() > 5000) {
-        auto it = store.seen_pop3.begin();
-        std::advance(it, (long)(store.seen_pop3.size() / 2));
-        store.seen_pop3.erase(store.seen_pop3.begin(), it);
-        seen_changed = true;
-      }
-    } else {
-      for (const auto& k : fr.new_keys) { store.seen_imap.insert(k); seen_changed = true; }
-      while (store.seen_imap.size() > 5000) {
-        auto it = store.seen_imap.begin();
-        std::advance(it, (long)(store.seen_imap.size() / 2));
-        store.seen_imap.erase(store.seen_imap.begin(), it);
-        seen_changed = true;
-      }
-    }
-    std::string serr;
-    if (fetched > 0) store.save_messages(serr);
-    // 只在真正有变化时才写配置，避免每 8 秒无条件磁盘写入
-    if (seen_changed || fetched > 0) store.save_config(serr);
-    poll_status.last_ts = util::now_epoch();
-    poll_status.ok = true;
-    poll_status.error.clear();
-    poll_status.fetched = fetched;
-    poll_status.skipped = skipped;
   } else {
     std::lock_guard lk(mtx);
     poll_status.last_ts = util::now_epoch();
@@ -591,6 +969,7 @@ bool App::poll_once(std::string& err) {
 }
 
 std::string App::api_state() {
+  const ai::Status ai_st = ai::manager().status();
   std::lock_guard lk(mtx);
   util::Json root = util::Json::make_object();
   root["self"] = util::Json::make_string(store.account.email);
@@ -619,6 +998,12 @@ std::string App::api_state() {
   sm["port"] = util::Json::make_number(store.account.smtp.port);
   sm["ssl"] = util::Json::make_bool(store.account.smtp.ssl);
   acc["smtp"] = sm;
+  util::Json aic = util::Json::make_object();
+  aic["enabled"] = util::Json::make_bool(store.account.ai.enabled);
+  aic["mirror"] = util::Json::make_string(store.account.ai.mirror);
+  aic["model_url"] = util::Json::make_string(store.account.ai.model_url);
+  aic["model_file"] = util::Json::make_string(store.account.ai.model_file);
+  acc["ai"] = aic;
   root["account"] = acc;
 
   util::Json poll = util::Json::make_object();
@@ -628,6 +1013,9 @@ std::string App::api_state() {
   poll["fetched"] = util::Json::make_number(poll_status.fetched);
   poll["skipped"] = util::Json::make_number(poll_status.skipped);
   root["poll"] = poll;
+
+  // 顶层 ai 状态对象（§4.6）
+  root["ai"] = json_ai_status(ai_st);
 
   std::vector<std::pair<int64_t, const Friend*>> sorted;
   for (const auto& f : store.friends) sorted.emplace_back(store.last_ts(f.email), &f);
@@ -672,9 +1060,27 @@ std::string App::api_messages(const std::string& peer) {
       util::Json item = util::Json::make_object();
       item["id"] = util::Json::make_number((double)m.id);
       item["dir"] = util::Json::make_string(m.dir);
+      item["kind"] = util::Json::make_string(m.kind.empty() ? "chat" : m.kind);
       item["text"] = util::Json::make_string(m.text);
+      if (!m.subject.empty()) item["subject"] = util::Json::make_string(m.subject);
       item["ts"] = util::Json::make_number((double)m.ts);
       item["time"] = util::Json::make_string(util::format_local(m.ts));
+      if (!m.mid.empty()) item["mid"] = util::Json::make_string(m.mid);
+      if (!m.uid.empty()) item["uid"] = util::Json::make_string(m.uid);
+      item["recalled"] = util::Json::make_bool(m.recalled);
+      if (m.has_quote) {
+        util::Json q = util::Json::make_object();
+        q["text"] = util::Json::make_string(m.quote.text);
+        q["from"] = util::Json::make_string(m.quote.from);
+        q["ts"] = util::Json::make_number((double)m.quote.ts);
+        q["mid"] = util::Json::make_string(m.quote.mid);
+        item["quote"] = q;
+      }
+      if (!m.attachments.empty()) {
+        util::Json ats = util::Json::make_array();
+        for (const auto& a : m.attachments) ats.arr.push_back(attachment_json(a));
+        item["attachments"] = ats;
+      }
       arr.arr.push_back(item);
     }
   }
@@ -682,11 +1088,53 @@ std::string App::api_messages(const std::string& peer) {
   return root.dump();
 }
 
-std::string App::api_send(const std::string& to, const std::string& text) {
-  std::string peer = util::to_lower(util::trim(to));
-  std::string msg = util::trim(text);
-  if (peer.empty() || msg.empty()) return json_err("收件人或内容为空");
+std::string App::api_send(const util::Json& body) {
+  const std::string peer = util::to_lower(util::trim(jstr(body, "to")));
+  std::string text = util::trim(jstr(body, "text"));
+  std::string kind = util::to_lower(util::trim(jstr(body, "kind", "chat")));
+  if (kind != "email") kind = "chat";
+  std::string user_subject =
+      util::truncate_utf8_chars(util::sanitize_header(util::trim(jstr(body, "subject"))), 200);
+  const std::string cc_raw = jstr(body, "cc");
+  const std::string bcc_raw = jstr(body, "bcc");
+
+  // 引用（后端截断到 500 字符）
+  bool has_quote = false;
+  mime::Quote quote;
+  if (const util::Json* q = body.get("quote"); q && q->is_object()) {
+    quote.text = util::replace_all(util::truncate_utf8_chars(jstr(*q, "text"), 500), "\r", "");
+    quote.from = util::sanitize_header(util::trim(jstr(*q, "from")));
+    quote.ts = jint64(*q, "ts", 0);
+    quote.mid = util::sanitize_header(util::trim(jstr(*q, "mid")));
+    has_quote = !quote.text.empty() || !quote.mid.empty();
+  }
+
+  // 暂存附件（从 data/uploads/ 取）
+  std::vector<Upload> ups;
+  if (const util::Json* at = body.get("attachments"); at && at->is_array()) {
+    std::lock_guard lk(upload_mtx);
+    for (const auto& it : at->arr) {
+      if (!it.is_object()) continue;
+      const std::string id = jstr(it, "id");
+      auto f = uploads.find(id);
+      if (f == uploads.end()) return json_err("附件已失效，请重新添加");
+      if (!file_exists(f->second.path)) {
+        uploads.erase(f);
+        return json_err("附件已失效，请重新添加");
+      }
+      ups.push_back(f->second);
+    }
+  }
+  long long att_total = 0;
+  for (const auto& u : ups) att_total += u.size;
+  if (att_total > mime::kMaxAttachmentsTotal) return json_err("附件总大小不能超过 24MB");
+
+  if (peer.empty()) return json_err("收件人不能为空");
+  if (text.empty() && ups.empty() && !has_quote) return json_err("内容不能为空");
+
+  // 账户与 SMTP 配置
   proto::SmtpConfig cfg;
+  ai::Config aicfg;
   {
     std::lock_guard lk(mtx);
     if (!store.is_friend(peer)) return json_err("对方不在好友白名单中，无法发送");
@@ -699,15 +1147,273 @@ std::string App::api_send(const std::string& to, const std::string& text) {
     cfg.user = store.account.email;
     cfg.pass = store.account.password;
     cfg.from_addr = store.account.email;
-    cfg.display_name = store.account.display_name.empty() ? store.account.email : store.account.display_name;
+    cfg.display_name =
+        store.account.display_name.empty() ? store.account.email : store.account.display_name;
+    aicfg = store.account.ai;
   }
   if (cfg.host.empty()) return json_err("请先在设置中配置 SMTP 服务器");
+
+  // 收件人 = to + cc + bcc（去重、去空、校验含 @，最多各 5 个）
+  std::vector<std::string> rcpts;
+  std::vector<std::string> cc_list, bcc_list;
+  parse_addr_list(peer, 5, rcpts);
+  parse_addr_list(cc_raw, 5, cc_list);
+  parse_addr_list(bcc_raw, 5, bcc_list);
+  for (const auto& c : cc_list) parse_addr_list(c, 1, rcpts);  // 复用去重（已在 out 中的会跳过）
+  for (const auto& b : bcc_list) parse_addr_list(b, 1, rcpts);
+  if (rcpts.empty()) return json_err("收件人邮箱格式不正确");
+
+  // 正文：email 模式允许无正文但需附件，补 "（无正文）"
+  std::string body_text = text;
+  if (kind == "email" && body_text.empty() && !ups.empty()) body_text = "（无正文）";
+
+  // 主题
+  const ai::Status ai_st = ai::manager().status();
+  const bool ai_on = aicfg.enabled && ai_st.model_ready;
+  std::string subject;
+  bool ai_generated = false;
+  if (kind == "chat") {
+    subject = "email-chatter 消息";
+    if (ai_on) {
+      std::string src, note;
+      std::string t = ai::manager().generate_title(text, src, note);
+      if (src == "ai" && !t.empty()) {
+        subject = util::truncate_utf8_chars(util::trim(t), 200);
+        ai_generated = true;
+      }
+    }
+  } else {
+    if (!user_subject.empty()) {
+      subject = user_subject;
+    } else {
+      std::string t;
+      if (ai_on) {
+        std::string src, note;
+        t = ai::manager().generate_title(text, src, note);
+        ai_generated = (src == "ai" && !t.empty());
+      }
+      if (!ai_generated) t = ai::heuristic_title(text);
+      subject = util::truncate_utf8_chars(util::trim(t), 200);
+      if (subject.empty()) subject = "无主题";
+    }
+  }
+
+  // 2.1 引用=reply：quote.mid 合法时主题加 Re:（本地存储记录带 Re: 的实际主题；
+  // build_message 内部同样幂等地加 Re: 并写 In-Reply-To/References）。
+  if (has_quote && mime::valid_msgid(quote.mid)) {
+    subject = mime::with_re_prefix(subject);
+  }
+
+  // 读取附件字节（发送失败不落盘、不移动暂存文件）
+  mime::ComposeOptions opt;
+  for (const auto& u : ups) {
+    std::string data;
+    if (!read_bytes(u.path, data)) return json_err("读取附件失败，请重新添加");
+    if ((long long)data.size() > mime::kMaxAttachmentBytes) {
+      return json_err("单个附件不能超过 16MB");
+    }
+    mime::Attachment a;
+    a.name = u.name;
+    a.mime = u.mime;
+    a.size = (long long)data.size();
+    a.inline_ = mime::is_image_mime(u.mime);
+    a.data = std::move(data);
+    opt.attachments.push_back(std::move(a));
+  }
+
+  opt.from_display = cfg.display_name;
+  opt.from_addr = cfg.from_addr;
+  opt.to_addr = peer;
+  opt.cc = join_addrs(cc_list);
+  opt.subject = subject;
+  opt.body = body_text;
+  opt.kind = kind;
+  opt.has_quote = has_quote;
+  opt.quote = quote;
+
+  std::string msgid;
+  std::string raw = mime::build_message(opt, &msgid);
   std::string err;
-  if (!proto::smtp_send(cfg, peer, "email-chatter 消息", msg, err)) return json_err(err);
+  if (!proto::smtp_send_raw(cfg, rcpts, raw, err)) {
+    return json_err(err.empty() ? "发送失败" : err);
+  }
+
+  // 发送成功：附件落盘到 data/attachments/，写本地 out 消息
+  std::vector<mime::Attachment> stored_atts;
+  const std::string att_dir = store.data_dir + "/attachments";
+  for (const auto& a : opt.attachments) {
+    std::string fname;
+    if (write_attachment_file(att_dir, a.name, a.data, fname)) {
+      mime::Attachment sa = a;
+      sa.file = fname;
+      sa.data.clear();
+      stored_atts.push_back(std::move(sa));
+    }
+  }
+
+  int64_t new_id = 0;
   {
     std::lock_guard lk(mtx);
-    store.add_message(peer, "out", msg, util::now_epoch());
-    store.save_messages(err);
+    Message m;
+    m.dir = "out";
+    m.kind = kind;
+    m.text = body_text;
+    m.subject = subject;
+    m.ts = util::now_epoch();
+    m.mid = msgid;
+    m.has_quote = has_quote;
+    m.quote = quote;
+    m.attachments = std::move(stored_atts);
+    store.add_message(peer, std::move(m), &new_id);
+    std::string serr;
+    store.save_messages(serr);
+  }
+  // 暂存文件不在这里删除：/api/upload 的暂存件允许在同一次会话内重复使用
+  // （FEATURE-SPEC §4.1 的“清理暂存文件”由启动时 24h 清理 + 发送成功后标记过期实现）。
+  // 具体做法：保留 metadata 与文件，直到进程退出或超过 24h；这样前端重试/复用不失效。
+  {
+    std::lock_guard lk(upload_mtx);
+    for (const auto& u : ups) {
+      auto it = uploads.find(u.id);
+      if (it != uploads.end()) it->second.consumed = true;
+    }
+  }
+
+  util::Json r = util::Json::make_object();
+  r["ok"] = util::Json::make_bool(true);
+  r["id"] = util::Json::make_number((double)new_id);
+  r["subject"] = util::Json::make_string(subject);
+  r["ai"] = util::Json::make_bool(ai_generated);
+  return r.dump();
+}
+
+std::string App::api_send(const std::string& to, const std::string& text) {
+  util::Json body = util::Json::make_object();
+  body["to"] = util::Json::make_string(to);
+  body["text"] = util::Json::make_string(text);
+  return api_send(body);
+}
+
+std::string App::api_upload(const std::string& name, const std::string& data) {
+  if ((long long)data.size() > mime::kMaxAttachmentBytes) return json_err("附件不能超过 16MB");
+  const std::string clean_name = mime::sanitize_filename(name.empty() ? "file.bin" : name, 120);
+  const std::string id = "u_" + std::to_string(util::now_epoch()) + "_" + random_hex(8);
+  const std::string dir = store.data_dir + "/uploads";
+  const std::string path = dir + "/" + id;
+  if (!ensure_dir(dir) || !write_file(path, data)) return json_err("保存上传文件失败");
+  Upload u;
+  u.id = id;
+  u.name = clean_name;
+  u.mime = base_mime(http::content_type_for(clean_name));
+  u.size = (long long)data.size();
+  u.path = path;
+  {
+    std::lock_guard lk(upload_mtx);
+    uploads[id] = u;
+    // 顺手清理已消费的旧暂存（避免长时间运行内存/磁盘累积）
+    if (uploads.size() > 200) {
+      for (auto it = uploads.begin(); it != uploads.end();) {
+        if (it->second.consumed && it->first != id) {
+          std::remove(it->second.path.c_str());
+          it = uploads.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+  util::Json r = util::Json::make_object();
+  r["ok"] = util::Json::make_bool(true);
+  r["id"] = util::Json::make_string(id);
+  r["name"] = util::Json::make_string(u.name);
+  r["size"] = util::Json::make_number((double)u.size);
+  r["mime"] = util::Json::make_string(u.mime);
+  return r.dump();
+}
+
+bool App::serve_attachment(const std::string& file, http::Response& resp) {
+  // 只允许 data/attachments/<basename>；basename 不得含 / \ .. 或盘符
+  if (file.empty() || file.find('/') != std::string::npos || file.find('\\') != std::string::npos ||
+      file.find("..") != std::string::npos || file.find(':') != std::string::npos) {
+    resp.set_json(404, json_err("附件不存在"));
+    return false;
+  }
+  std::string data;
+  if (!read_bytes(store.data_dir + "/attachments/" + file, data)) {
+    resp.set_json(404, json_err("附件不存在"));
+    return false;
+  }
+  const std::string ct = http::content_type_for(file);
+  resp.set_bytes(200, ct, std::move(data));
+  if (mime::is_image_mime(ct)) {
+    resp.set_header("Content-Disposition", "inline");
+  } else {
+    resp.set_header("Content-Disposition",
+                    "attachment; filename*=UTF-8''" + util::url_encode_component(file));
+  }
+  return true;
+}
+
+std::string App::api_recall(const util::Json& body) {
+  const std::string peer = util::to_lower(util::trim(jstr(body, "with")));
+  const int64_t id = jint64(body, "id", 0);
+  std::string mid;
+  proto::SmtpConfig cfg;
+  {
+    std::lock_guard lk(mtx);
+    if (!store.is_friend(peer)) return json_err("对方不在好友白名单中，无法撤回");
+    auto it = store.conversations.find(peer);
+    if (it != store.conversations.end()) {
+      for (const auto& m : it->second) {
+        if (m.id == id && m.dir == "out" && !m.recalled && !m.mid.empty()) {
+          mid = m.mid;
+          break;
+        }
+      }
+    }
+    if (mid.empty()) return json_err("该消息不支持撤回（缺少邮件标识或已撤回）");
+    if (store.account.email.empty() || store.account.password.empty()) {
+      return json_err("请先在设置中填写邮箱账户与客户端授权密码");
+    }
+    cfg.host = store.account.smtp.host;
+    cfg.port = store.account.smtp.port;
+    cfg.ssl = store.account.smtp.ssl;
+    cfg.user = store.account.email;
+    cfg.pass = store.account.password;
+    cfg.from_addr = store.account.email;
+    cfg.display_name =
+        store.account.display_name.empty() ? store.account.email : store.account.display_name;
+  }
+  if (cfg.host.empty()) return json_err("请先在设置中配置 SMTP 服务器");
+
+  // 组装撤回通知邮件（§3.1）：Subject: 撤回了一条消息，Kind: recall，X-Email-Chatter-Recall
+  mime::ComposeOptions opt;
+  opt.from_display = cfg.display_name;
+  opt.from_addr = cfg.from_addr;
+  opt.to_addr = peer;
+  opt.subject = "撤回了一条消息";
+  opt.body = "对方撤回了一条消息";
+  opt.kind = "recall";
+  opt.recall_mid = mid;
+  std::string raw = mime::build_message(opt);
+  std::string err;
+  if (!proto::smtp_send_raw(cfg, std::vector<std::string>{peer}, raw, err)) {
+    return json_err(err.empty() ? "撤回通知发送失败" : err);
+  }
+
+  {
+    std::lock_guard lk(mtx);
+    auto it = store.conversations.find(peer);
+    if (it != store.conversations.end()) {
+      for (auto& m : it->second) {
+        if (m.id == id) {
+          m.recalled = true;
+          break;
+        }
+      }
+    }
+    std::string serr;
+    store.save_messages(serr);
   }
   return json_ok();
 }
@@ -715,10 +1421,20 @@ std::string App::api_send(const std::string& to, const std::string& text) {
 std::string App::api_read(const std::string& peer) {
   {
     std::lock_guard lk(mtx);
-    store.mark_read(util::to_lower(util::trim(peer)));
+    const std::string p = util::to_lower(util::trim(peer));
+    store.mark_read(p);
+    // 2.1：打开会话 = 标记邮箱已读。收集该会话 dir=in 的 IMAP UID 到 pending，
+    // 由下一次轮询批量 UID STORE +FLAGS.SILENT (\Seen)（失败保留重试）。
+    auto it = store.conversations.find(p);
+    if (it != store.conversations.end()) {
+      for (const auto& m : it->second) {
+        if (m.dir == "in" && !m.uid.empty()) pending_seen_imap.insert(m.uid);
+      }
+    }
     std::string err;
     store.save_config(err);
   }
+  trigger_poll();  // 不阻塞 HTTP 响应；由 poller 稍后完成服务器端标记
   return json_ok();
 }
 
@@ -747,6 +1463,7 @@ std::string App::api_config(const util::Json& body) {
   // 只覆盖请求中实际提供的字段，避免「保存一个开关」把邮箱/密码等未传字段清空
   const std::string email = util::to_lower(util::trim(body.has("email") ? jstr(body, "email") : ""));
   if (!email.empty() && email.find('@') == std::string::npos) return json_err("邮箱地址格式不正确");
+  ai::Config new_ai;
   {
     std::lock_guard lk(mtx);
     if (body.has("email")) store.account.email = email;
@@ -779,11 +1496,33 @@ std::string App::api_config(const util::Json& body) {
       store.account.smtp.port = p;
       store.account.smtp.ssl = jbool(*sm, "ssl", true);
     }
+    // ai 对象：只覆盖提供的字段（§2.1）
+    if (const util::Json* a = body.get("ai"); a && a->is_object()) {
+      if (a->has("enabled")) store.account.ai.enabled = jbool(*a, "enabled", store.account.ai.enabled);
+      if (a->has("mirror")) {
+        std::string mirror = util::sanitize_header(util::trim(jstr(*a, "mirror")));
+        store.account.ai.mirror = mirror.empty() ? "https://hf-mirror.com" : mirror;
+      }
+      if (a->has("model_url")) {
+        store.account.ai.model_url =
+            util::sanitize_header(util::trim(jstr(*a, "model_url")));
+      }
+      if (a->has("model_file")) {
+        std::string mf = mime::sanitize_filename(util::trim(jstr(*a, "model_file")), 120);
+        if (!mf.empty() && mf != "file") store.account.ai.model_file = mf;
+      }
+    }
+    new_ai = store.account.ai;
     std::string err;
     if (!store.save_config(err)) return json_err(err);
   }
+  ai::manager().set_config(new_ai);
   trigger_poll();
-  return json_ok();
+  // 与 Node 后端对齐：返回 ok + 最新 ai 状态对象（保持 ok 字段语义不变）
+  util::Json resp = util::Json::make_object();
+  resp["ok"] = util::Json::make_bool(true);
+  resp["ai"] = json_ai_status(ai::manager().status());
+  return resp.dump();
 }
 
 namespace {
@@ -1012,6 +1751,72 @@ std::string App::api_probe(const util::Json& body) {
   return probe_candidates_json(list);
 }
 
+std::string App::api_ai_status() {
+  util::Json r = util::Json::make_object();
+  r["ok"] = util::Json::make_bool(true);
+  r["ai"] = json_ai_status(ai::manager().status());
+  return r.dump();
+}
+
+std::string App::api_ai_download() {
+  util::Json r = util::Json::make_object();
+  const ai::Status before = ai::manager().status();
+  if (before.model_ready) {
+    r["ok"] = util::Json::make_bool(true);
+    r["already"] = util::Json::make_bool(true);
+    r["ai"] = json_ai_status(before);
+    return r.dump();
+  }
+  std::string err;
+  const bool started = ai::manager().start_download(err);
+  const ai::Status st = ai::manager().status();
+  if (!started) {
+    if (st.downloading) {
+      // 已有下载在进行：视为成功（幂等）
+      r["ok"] = util::Json::make_bool(true);
+      r["ai"] = json_ai_status(st);
+      return r.dump();
+    }
+    r["ok"] = util::Json::make_bool(false);
+    r["error"] = util::Json::make_string(err.empty() ? "无法开始下载" : err);
+    r["ai"] = json_ai_status(st);
+    return r.dump();
+  }
+  r["ok"] = util::Json::make_bool(true);
+  r["ai"] = json_ai_status(st);
+  return r.dump();
+}
+
+std::string App::api_ai_cancel() {
+  ai::manager().cancel_download();
+  util::Json r = util::Json::make_object();
+  r["ok"] = util::Json::make_bool(true);
+  r["ai"] = json_ai_status(ai::manager().status());
+  return r.dump();
+}
+
+std::string App::api_ai_title(const util::Json& body) {
+  const std::string text = jstr(body, "text");
+  util::Json r = util::Json::make_object();
+  std::string title, source, note;
+  if (util::trim(text).empty()) {
+    title = ai::heuristic_title(text);
+    source = "heuristic";
+  } else {
+    title = ai::manager().generate_title(text, source, note);
+    if (title.empty()) {
+      title = ai::heuristic_title(text);
+      source = "heuristic";
+    }
+    if (source.empty()) source = "heuristic";
+  }
+  r["ok"] = util::Json::make_bool(true);
+  r["subject"] = util::Json::make_string(title);
+  r["source"] = util::Json::make_string(source);
+  if (source != "ai" && !note.empty()) r["note"] = util::Json::make_string(note);
+  return r.dump();
+}
+
 http::Handler App::make_handler() {
   App* self = this;
   return [self](const http::Request& req, http::Response& resp) {
@@ -1028,6 +1833,19 @@ http::Handler App::make_handler() {
         resp.set_json(403, json_err("拒绝访问：来源不受信任（Host/Origin 校验未通过）"));
         return;
       }
+      // POST 的 JSON body 统一校验：解析失败/非对象（如 '['*60000 深度炸弹、随机串）
+      // 直接返回 400，不进入业务逻辑（避免被当成空对象静默成功）。
+      // 空 body 视为 {}（兼容旧调用约定）。
+      auto parse_body = [&req, &resp](util::Json& out) -> bool {
+        out = util::Json::parse(req.body);
+        if (out.is_object()) return true;
+        if (util::trim(req.body).empty() || util::trim(req.body) == "null") {
+          out = util::Json::make_object();
+          return true;
+        }
+        resp.set_json(400, json_err("请求体不是合法 JSON 对象"));
+        return false;
+      };
       if (path == "/api/state" && req.method == "GET") {
         resp.set_json(200, self->api_state());
         return;
@@ -1037,22 +1855,40 @@ http::Handler App::make_handler() {
         return;
       }
       if (path == "/api/send" && req.method == "POST") {
-        util::Json body = util::Json::parse(req.body);
-        resp.set_json(200, self->api_send(jstr(body, "to"), jstr(body, "text")));
+        util::Json body;
+        if (!parse_body(body)) return;
+        resp.set_json(200, self->api_send(body));
+        return;
+      }
+      if (path == "/api/upload" && req.method == "POST") {
+        resp.set_json(200, self->api_upload(query_param(query, "name"), req.body));
+        return;
+      }
+      if (path == "/api/attachment" && (req.method == "GET" || req.method == "HEAD")) {
+        self->serve_attachment(query_param(query, "file"), resp);
+        return;
+      }
+      if (path == "/api/recall" && req.method == "POST") {
+        util::Json body;
+        if (!parse_body(body)) return;
+        resp.set_json(200, self->api_recall(body));
         return;
       }
       if (path == "/api/read" && req.method == "POST") {
-        util::Json body = util::Json::parse(req.body);
+        util::Json body;
+        if (!parse_body(body)) return;
         resp.set_json(200, self->api_read(jstr(body, "with")));
         return;
       }
       if (path == "/api/friends" && req.method == "POST") {
-        util::Json body = util::Json::parse(req.body);
+        util::Json body;
+        if (!parse_body(body)) return;
         resp.set_json(200, self->api_friends(body));
         return;
       }
       if (path == "/api/config" && req.method == "POST") {
-        util::Json body = util::Json::parse(req.body);
+        util::Json body;
+        if (!parse_body(body)) return;
         resp.set_json(200, self->api_config(body));
         return;
       }
@@ -1061,12 +1897,35 @@ http::Handler App::make_handler() {
         return;
       }
       if (path == "/api/probe" && req.method == "POST") {
-        util::Json body = util::Json::parse(req.body);
+        util::Json body;
+        if (!parse_body(body)) return;
         resp.set_json(200, self->api_probe(body));
         return;
       }
       if (path == "/api/poll" && req.method == "POST") {
         resp.set_json(200, self->api_poll());
+        return;
+      }
+      if (path == "/api/ai/status" && req.method == "GET") {
+        resp.set_json(200, self->api_ai_status());
+        return;
+      }
+      if (path == "/api/ai/download" && req.method == "POST") {
+        util::Json body;
+        if (!parse_body(body)) return;
+        resp.set_json(200, self->api_ai_download());
+        return;
+      }
+      if (path == "/api/ai/cancel" && req.method == "POST") {
+        util::Json body;
+        if (!parse_body(body)) return;
+        resp.set_json(200, self->api_ai_cancel());
+        return;
+      }
+      if (path == "/api/ai/title" && req.method == "POST") {
+        util::Json body;
+        if (!parse_body(body)) return;
+        resp.set_json(200, self->api_ai_title(body));
         return;
       }
       resp.set_text(404, "unknown api");

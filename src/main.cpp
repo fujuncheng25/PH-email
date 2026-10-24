@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "app.hpp"
+#include "proto.hpp"
 #include "util.hpp"
 
 #ifdef _WIN32
@@ -120,6 +121,7 @@ struct Args {
   std::string web;
   std::string host = "127.0.0.1";
   bool no_browser = false;
+  bool tls_info = false;  // --tls-info：打印 TLS 根证书诊断后退出
 };
 
 void print_usage(const char* prog) {
@@ -129,6 +131,7 @@ void print_usage(const char* prog) {
       "  --host ADDR      监听地址（默认 127.0.0.1；对外网开放用 0.0.0.0）\n"
       "  --data DIR       数据目录（默认: 程序目录/data，必须在程序目录内）\n"
       "  --web DIR        网页资源目录（默认: 程序目录/web，必须在程序目录内）\n"
+      "  --tls-info       打印 TLS 根证书诊断信息后退出（排查“问候失败”）\n"
       "  --no-browser     启动后不自动打开浏览器\n"
       "  -h, --help       显示此帮助\n",
       prog);
@@ -157,6 +160,8 @@ bool parse_args(int argc, char** argv, Args& args) {
       if (!need(args.web)) return false;
     } else if (a == "--no-browser") {
       args.no_browser = true;
+    } else if (a == "--tls-info") {
+      args.tls_info = true;
     } else {
       std::fprintf(stderr, "未知参数: %s\n", a.c_str());
       return false;
@@ -172,6 +177,19 @@ int main(int argc, char** argv) {
   if (!parse_args(argc, argv, args)) {
     print_usage(argv[0]);
     return 1;
+  }
+  // --tls-info：只打印 TLS 根证书诊断（不启动服务、不读写 data），用于排查“问候失败”。
+  if (args.tls_info) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+    std::string info;
+    const bool ok = proto::tls_info(info);
+    std::printf("Email Chatter TLS 诊断\n");
+    std::printf("%s", info.c_str());
+    std::printf("程序目录: %s\n", exe_dir(argc > 0 ? argv[0] : "").c_str());
+    std::fflush(stdout);
+    return ok ? 0 : 1;
   }
   const std::string edir = exe_dir(argc > 0 ? argv[0] : "");
   const std::string prog = canon_path(edir);

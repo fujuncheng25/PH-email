@@ -56,6 +56,15 @@ bool is_ascii(const std::string& s);
 // 头字段注入防护：把 CR/LF 等换成空格，保证单行、不可注入新头
 std::string sanitize_header(const std::string& s);
 
+// 按 UTF-8 字符（码点）截断，最多 max_chars 个字符；不会截断半个多字节序列。
+std::string truncate_utf8_chars(const std::string& s, size_t max_chars);
+
+// UTF-8 字符（码点）数量（非法序列按单字节计）。
+size_t utf8_chars(const std::string& s);
+
+// URL query/路径分量百分号编码（保留 RFC3986 unreserved 字符，其余 %XX）。
+std::string url_encode_component(const std::string& s);
+
 // 清洗用户输入的主机名：去掉 https:// 等协议头、路径、查询串、userinfo、空格；
 // 若形如 "host:port" 且端口合法，则把端口写入 port（0 = 保持原端口不变）。
 std::string normalize_host(const std::string& raw, int& port);

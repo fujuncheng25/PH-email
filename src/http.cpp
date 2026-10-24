@@ -75,20 +75,6 @@ const char* reason_for(int status) {
   }
 }
 
-std::string content_type_for(const std::string& path) {
-  auto dot = path.rfind('.');
-  std::string ext = dot == std::string::npos ? "" : lower(path.substr(dot + 1));
-  if (ext == "html" || ext == "htm") return "text/html; charset=utf-8";
-  if (ext == "js") return "application/javascript; charset=utf-8";
-  if (ext == "css") return "text/css; charset=utf-8";
-  if (ext == "json") return "application/json; charset=utf-8";
-  if (ext == "svg") return "image/svg+xml";
-  if (ext == "png") return "image/png";
-  if (ext == "ico") return "image/x-icon";
-  if (ext == "txt") return "text/plain; charset=utf-8";
-  return "application/octet-stream";
-}
-
 bool read_file(const std::string& path, std::string& out) {
   std::ifstream f(path, std::ios::binary);
   if (!f) return false;
@@ -115,6 +101,13 @@ std::string build_response(const Response& resp) {
   r += "Connection: close\r\n";
   r += "Cache-Control: no-store\r\n";
   r += "X-Content-Type-Options: nosniff\r\n";
+  for (const auto& kv : resp.headers) {
+    // 头注入防护：名称/值里的 CR/LF 直接剔除
+    std::string name, value;
+    for (char c : kv.first) if (c != '\r' && c != '\n') name += c;
+    for (char c : kv.second) if (c != '\r' && c != '\n') value += c;
+    if (!name.empty()) r += name + ": " + value + "\r\n";
+  }
   r += "\r\n";
   r += resp.body;
   return r;
@@ -190,7 +183,8 @@ bool handle_client(socket_t client, const std::string& web_dir, const Handler& h
       pos = e + 1;
     }
   }
-  if (content_length > 8u * 1024 * 1024) return false;
+  // 请求体上限 32MB（/api/upload 单文件 ≤16MB，见 FEATURE-SPEC §7）
+  if (content_length > 32u * 1024 * 1024) return false;
   while (rest.size() < content_length) {
     int n = (int)::recv(client, tmp, sizeof tmp, 0);
     if (n <= 0) break;
@@ -224,6 +218,41 @@ bool handle_client(socket_t client, const std::string& web_dir, const Handler& h
 }
 
 } // namespace
+
+std::string content_type_for(const std::string& path) {
+  auto dot = path.rfind('.');
+  std::string ext = dot == std::string::npos ? "" : lower(path.substr(dot + 1));
+  if (ext == "html" || ext == "htm") return "text/html; charset=utf-8";
+  if (ext == "js") return "application/javascript; charset=utf-8";
+  if (ext == "css") return "text/css; charset=utf-8";
+  if (ext == "json") return "application/json; charset=utf-8";
+  if (ext == "svg") return "image/svg+xml";
+  if (ext == "png") return "image/png";
+  if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+  if (ext == "gif") return "image/gif";
+  if (ext == "webp") return "image/webp";
+  if (ext == "bmp") return "image/bmp";
+  if (ext == "ico") return "image/x-icon";
+  if (ext == "pdf") return "application/pdf";
+  if (ext == "zip") return "application/zip";
+  if (ext == "txt") return "text/plain; charset=utf-8";
+  if (ext == "csv") return "text/csv; charset=utf-8";
+  if (ext == "mp4") return "video/mp4";
+  if (ext == "webm") return "video/webm";
+  if (ext == "mp3") return "audio/mpeg";
+  if (ext == "ogg") return "audio/ogg";
+  if (ext == "wav") return "audio/wav";
+  if (ext == "doc") return "application/msword";
+  if (ext == "docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (ext == "xls") return "application/vnd.ms-excel";
+  if (ext == "xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (ext == "ppt") return "application/vnd.ms-powerpoint";
+  if (ext == "pptx") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  if (ext == "woff") return "font/woff";
+  if (ext == "woff2") return "font/woff2";
+  if (ext == "ttf") return "font/ttf";
+  return "application/octet-stream";
+}
 
 bool listen(const std::string& bind_host, int port, intptr_t& out_fd, int& out_port, std::string& err) {
   err.clear();

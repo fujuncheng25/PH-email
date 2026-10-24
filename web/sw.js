@@ -1,5 +1,5 @@
 /* Email Chatter service worker: cache static shell, never cache /api */
-const CACHE = 'email-chatter-v2';
+const CACHE = 'email-chatter-v3';
 const CORE = [
   './',
   'index.html',

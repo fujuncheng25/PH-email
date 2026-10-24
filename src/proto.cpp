@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <sstream>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -42,6 +45,15 @@ typedef int socket_t;
 #include <openssl/x509v3.h>   // X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS（3.x 起定义在 x509v3.h）
 #endif
 
+#ifdef _WIN32
+// Windows 系统根证书库（crypt32）：OpenSSL 默认 OPENSSLDIR 在 Windows 上通常不存在，
+// 必须显式枚举系统证书库，否则 X509_VERIFY_PARAM 0 根证书 → 所有 TLS 握手证书校验失败。
+#include <windows.h>
+#include <wincrypt.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include "util.hpp"
 
 namespace proto {
@@ -57,6 +69,41 @@ static void ensure_winsock() {
 }
 #endif
 
+namespace {
+// 把“TLS 握手失败 → 回退明文”的原因附加到最终错误信息里，
+// 避免真实原因被裸“问候失败”掩盖（Windows 根证书缺失的典型症状）。
+std::string tls_fallback_note(const std::string& tls_err) {
+  if (tls_err.empty()) return "";
+  return "（原 TLS 失败原因：" + tls_err +
+         "；已回退明文重试——请检查端口/SSL 配置或本机根证书，可用 --tls-info 查看）";
+}
+
+// 判断某个连接错误是否属于 TLS 握手失败（需要回退明文的情况）
+bool is_tls_handshake_error(const std::string& e) {
+  return e.find("TLS 握手失败") != std::string::npos ||
+         e.find("STARTTLS 握手失败") != std::string::npos;
+}
+
+// 建立邮件协议连接：优先按配置做 TLS；TLS 握手失败（证书/根证书问题或端口不是 SSL）
+// 时自动回退明文重连，并把原始 TLS 失败原因返回给调用方（用于后续错误信息）。
+// 返回 false 时 err 为底层连接错误（不含“无法连接 X 服务器”前缀）。
+bool connect_mail(Net& net, const std::string& host, int port, bool ssl, int timeout_ms,
+                  bool& used_tls, std::string& tls_reason, std::string& err) {
+  used_tls = ssl;
+  tls_reason.clear();
+  if (net.connect(host, port, ssl, timeout_ms)) return true;
+  if (ssl && is_tls_handshake_error(net.last_error())) {
+    tls_reason = net.last_error();
+    used_tls = false;
+    if (net.connect(host, port, false, timeout_ms)) return true;
+    err = net.last_error();
+    return false;
+  }
+  err = net.last_error();
+  return false;
+}
+} // namespace
+
 bool Net::has_tls() {
 #ifdef HAS_OPENSSL
   return true;
@@ -66,32 +113,215 @@ bool Net::has_tls() {
 }
 
 #ifdef HAS_OPENSSL
-static SSL_CTX* tls_ctx() {
-  static SSL_CTX* ctx = nullptr;
-  if (!ctx) {
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
-    ctx = SSL_CTX_new(TLS_client_method());
-    if (ctx) {
-      SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
-      SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-      SSL_CTX_set_default_verify_paths(ctx);
-    }
-  }
-  return ctx;
+namespace {
+
+// TLS 信任链加载统计（供 --tls-info 诊断；“问候失败”根因排查用）
+struct TlsTrustInfo {
+  int default_paths = 0;  // OpenSSL 默认信任路径（含 SSL_CERT_FILE/SSL_CERT_DIR）新增证书数
+#ifdef _WIN32
+  int win_current_user_root = 0;
+  int win_current_user_ca = 0;
+  int win_local_machine_root = 0;
+  int win_local_machine_ca = 0;
+#endif
+  std::vector<std::pair<std::string, int>> local_files;  // 本地 CA 文件与新增证书数
+  std::string search_dir;  // 本地 CA 搜索目录（程序目录）
+  bool initialized = false;
+};
+
+TlsTrustInfo g_trust;
+std::mutex g_trust_mu;
+SSL_CTX* g_tls_ctx = nullptr;
+
+// 可执行文件所在目录（用于查找程序目录内的 cacert.pem 等本地 CA）
+std::string platform_exe_dir() {
+  std::string path;
+#ifdef _WIN32
+  char buf[MAX_PATH + 1];
+  DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return ".";
+  path.assign(buf, n);
+#elif defined(__APPLE__)
+  char buf[4096];
+  uint32_t size = sizeof buf;
+  if (_NSGetExecutablePath(buf, &size) != 0) return ".";
+  path = buf;
+#else
+  char buf[4096];
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+  if (n <= 0) return ".";
+  buf[n] = 0;
+  path = buf;
+#endif
+  auto pos = path.find_last_of("\\/");
+  if (pos == std::string::npos) return ".";
+  return path.substr(0, pos);
 }
 
+// 统计 X509_STORE 中已加载的证书数（用于诊断与“是否加载成功”计数）
+int count_store_certs(X509_STORE* store) {
+  if (!store) return 0;
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+  STACK_OF(X509_OBJECT)* objs = X509_STORE_get0_objects(store);
+  if (!objs) return 0;
+  int n = 0;
+  for (int i = 0; i < sk_X509_OBJECT_num(objs); ++i) {
+    X509_OBJECT* obj = sk_X509_OBJECT_value(objs, i);
+    if (obj && X509_OBJECT_get_type(obj) == X509_LU_X509) ++n;
+  }
+  return n;
+#else
+  (void)store;
+  return 0;
+#endif
+}
+
+// 加载单个 PEM CA 文件（若存在）。返回新增证书数；-1 = 文件不存在；-2 = 解析失败。
+int add_ca_file(SSL_CTX* ctx, const std::string& path) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return -1;
+  std::fclose(f);
+  X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+  int before = count_store_certs(store);
+  int rc = SSL_CTX_load_verify_locations(ctx, path.c_str(), nullptr);
+  int after = count_store_certs(store);
+  if (rc != 1) return -2;
+  return after > before ? after - before : 0;
+}
+
+#ifdef _WIN32
+// 把 Windows 证书库（CurrentUser/LocalMachine 的 ROOT/CA）里的证书加入 OpenSSL 信任库。
+// 忽略单个证书解析/重复失败；返回新增数量。
+int add_windows_store(X509_STORE* store, DWORD location, const wchar_t* name) {
+  if (!store) return 0;
+  HCERTSTORE h = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                               location | CERT_STORE_READONLY_FLAG, name);
+  if (!h) return 0;
+  int added = 0;
+  PCCERT_CONTEXT p = nullptr;
+  while ((p = CertEnumCertificatesInStore(h, p)) != nullptr) {
+    const unsigned char* der = p->pbCertEncoded;
+    X509* x = d2i_X509(nullptr, &der, (long)p->cbCertEncoded);
+    if (x) {
+      if (X509_STORE_add_cert(store, x) == 1) ++added;
+      X509_free(x);
+    }
+  }
+  CertCloseStore(h, 0);
+  return added;
+}
+#endif
+
+// 初始化 TLS 信任链（仅一次，在 g_trust_mu 保护下调用）：
+// 1) OpenSSL 默认信任路径（Linux/macOS 系统 CA；也尊重 SSL_CERT_FILE/SSL_CERT_DIR）
+// 2) Windows 系统证书库（CurrentUser/LocalMachine × ROOT/CA）—— Windows 上 OPENSSLDIR 通常不存在
+// 3) 程序目录本地 CA 文件：cacert.pem / cert.pem / certs/cacert.pem / data/cacert.pem
+void init_tls_trust_locked(SSL_CTX* ctx) {
+  X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+  int before = count_store_certs(store);
+  SSL_CTX_set_default_verify_paths(ctx);
+  int after = count_store_certs(store);
+  g_trust.default_paths = after > before ? after - before : after;
+#ifdef _WIN32
+  g_trust.win_current_user_root =
+      add_windows_store(store, CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
+  g_trust.win_current_user_ca =
+      add_windows_store(store, CERT_SYSTEM_STORE_CURRENT_USER, L"CA");
+  g_trust.win_local_machine_root =
+      add_windows_store(store, CERT_SYSTEM_STORE_LOCAL_MACHINE, L"ROOT");
+  g_trust.win_local_machine_ca =
+      add_windows_store(store, CERT_SYSTEM_STORE_LOCAL_MACHINE, L"CA");
+#endif
+  g_trust.search_dir = platform_exe_dir();
+  static const char* kCandidates[] = {"cacert.pem", "cert.pem", "certs/cacert.pem",
+                                      "data/cacert.pem"};
+  for (const char* cand : kCandidates) {
+    const std::string path = g_trust.search_dir + "/" + cand;
+    int added = add_ca_file(ctx, path);
+    if (added >= 0) g_trust.local_files.emplace_back(path, added);
+  }
+  g_trust.initialized = true;
+}
+
+SSL_CTX* tls_ctx() {
+  std::lock_guard<std::mutex> lk(g_trust_mu);
+  if (g_tls_ctx) return g_tls_ctx;
+  SSL_library_init();
+  SSL_load_error_strings();
+  OpenSSL_add_all_algorithms();
+  SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+  if (ctx) {
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    init_tls_trust_locked(ctx);
+  }
+  g_tls_ctx = ctx;
+  return g_tls_ctx;
+}
+
+} // namespace
+
+bool tls_info(std::string& out) {
+  out.clear();
+  SSL_CTX* ctx = tls_ctx();  // 触发信任链初始化
+  std::lock_guard<std::mutex> lk(g_trust_mu);
+  out += "OpenSSL 版本: " + std::string(OpenSSL_version(OPENSSL_VERSION)) + "\n";
+  const int total = count_store_certs(ctx ? SSL_CTX_get_cert_store(ctx) : nullptr);
+  out += "受信任根证书总数: " + std::to_string(total) + " 个\n";
+  out += "OpenSSL 默认信任路径加载: " + std::to_string(g_trust.default_paths) + " 个证书\n";
+#ifdef _WIN32
+  out += "Windows 系统根证书: CurrentUser\\Root=" +
+         std::to_string(g_trust.win_current_user_root) + " 个, CurrentUser\\CA=" +
+         std::to_string(g_trust.win_current_user_ca) + " 个, LocalMachine\\Root=" +
+         std::to_string(g_trust.win_local_machine_root) + " 个, LocalMachine\\CA=" +
+         std::to_string(g_trust.win_local_machine_ca) + " 个\n";
+#else
+  out += "Windows 系统根证书: 不适用（非 Windows 平台，使用 OpenSSL 默认系统 CA 路径）\n";
+#endif
+  out += "本地 CA 文件搜索目录: " + g_trust.search_dir + "\n";
+  if (g_trust.local_files.empty()) {
+    out += "本地 CA 文件: 未找到（可放置 cacert.pem 于程序目录）\n";
+  } else {
+    for (const auto& f : g_trust.local_files) {
+      out += "本地 CA 文件: " + f.first + "（新增 " + std::to_string(f.second) + " 个证书）\n";
+    }
+  }
+  if (total == 0) {
+    out += "警告: 未加载到任何受信任根证书，TLS 证书校验会失败！\n";
+  }
+  out += "提示: 若 TLS 握手仍失败，请把 cacert.pem（PEM 格式 CA 证书包）放到程序目录，"
+         "或用环境变量 SSL_CERT_FILE 指定 CA 文件。\n";
+  return true;
+}
+
+#else  // !HAS_OPENSSL
+
+bool tls_info(std::string& out) {
+  out = "本程序未编译 TLS 支持（构建时未找到 OpenSSL）\n";
+  return false;
+}
+
+#endif  // HAS_OPENSSL
+
+#ifdef HAS_OPENSSL
 // 配置 TLS 连接的主机名校验（SNI + 证书主机名）。
 // 原实现只做证书链校验（SSL_VERIFY_PEER），不做主机名校验：
 // 中间人只要有一张任意合法 CA 签发的证书就能通过握手，
-// 即使证书的域名与所连服务器完全无关。这里补上 X509_VERIFY_PARAM_set1_host。
+// 即使证书的域名与所连服务器完全无关。这里补上主机名校验。
+// 注意：IP 字面量（如 127.0.0.1、校园网邮件服务器 IP）必须用 set1_ip_asc，
+// set1_host 只做 DNS 名匹配，会导致 IP 地址访问时误报“certificate verify failed”。
 static bool ssl_setup_host(SSL* s, const std::string& host) {
   if (host.empty()) return false;
-  if (SSL_set_tlsext_host_name(s, host.c_str()) != 1) return false;  // SNI
+  unsigned char abuf[16];
+  const bool is_ip = inet_pton(AF_INET, host.c_str(), abuf) == 1 ||
+                     inet_pton(AF_INET6, host.c_str(), abuf) == 1;
+  if (!is_ip) {
+    if (SSL_set_tlsext_host_name(s, host.c_str()) != 1) return false;  // SNI（IP 不发送 SNI）
+  }
   X509_VERIFY_PARAM* param = SSL_get0_param(s);
   if (!param) return false;
   X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+  if (is_ip) return X509_VERIFY_PARAM_set1_ip_asc(param, host.c_str()) == 1;
   // 0 = 不附加 NUL，按 host 全名匹配证书 SAN/CN
   return X509_VERIFY_PARAM_set1_host(param, host.c_str(), 0) == 1;
 }
@@ -326,6 +556,24 @@ bool Net::recv_exact(std::string& out, size_t n) {
   return true;
 }
 
+bool Net::skip_exact(size_t n) {
+  // 丢弃 n 字节但保持接收缓冲区/协议流对齐；不分配与 n 同规模的内存。
+  while (n > 0) {
+    if (!buf.empty()) {
+      size_t take = std::min(n, buf.size());
+      buf.erase(0, take);
+      n -= take;
+      continue;
+    }
+    char tmp[8192];
+    size_t want = std::min(n, sizeof tmp);
+    int r = raw_recv(tmp, (int)want);
+    if (r <= 0) return false;
+    n -= (size_t)r;
+  }
+  return true;
+}
+
 void Net::close() {
   if (ssl) {
 #ifdef HAS_OPENSSL
@@ -342,6 +590,11 @@ void Net::close() {
 }
 
 namespace {
+
+// 收信内存安全边界（FEATURE-SPEC §3.2：单封解析上限 50MB）。
+// 单封超限：跳过该邮件并记 seen（避免每轮重复下载）；单轮累计超预算：本轮停止，剩余下轮再取。
+constexpr size_t kMaxMailBytes = 50u * 1024 * 1024;
+constexpr size_t kMaxRoundBytes = 48u * 1024 * 1024;
 
 bool read_response(Net& net, int& code, std::string& text) {
   std::string line;
@@ -386,32 +639,39 @@ bool smtp_maybe_starttls(Net& net, const SmtpConfig& cfg, const std::string& cap
 
 } // namespace
 
-bool smtp_send(const SmtpConfig& cfg, const std::string& to_addr, const std::string& subject,
-               const std::string& body, std::string& err) {
+bool smtp_send_raw(const SmtpConfig& cfg, const std::vector<std::string>& rcpts,
+                   const std::string& raw_message, std::string& err) {
   err.clear();
   if (cfg.host.empty()) { err = "SMTP 服务器未配置"; return false; }
-  SmtpConfig c = cfg;
-  bool want_tls = cfg.ssl;
-  Net net;
-  if (!net.connect(c.host, c.port, want_tls, 20000)) {
-    // 配置为 SSL 但握手失败（常见于把 587/25/110/143 明文端口误勾了 SSL）：
-    // 自动回退为明文连接 + STARTTLS 升级，保证功能可用且不降安全（升级后同样校验证书主机名）。
-    if (want_tls && net.last_error().find("TLS 握手失败") != std::string::npos) {
-      want_tls = false;
-      c.ssl = false;
-      if (!net.connect(c.host, c.port, false, 20000)) {
-        err = "无法连接 SMTP 服务器 " + c.host + ":" + std::to_string(c.port) + "：" + net.last_error();
-        return false;
-      }
-    } else {
-      err = "无法连接 SMTP 服务器 " + c.host + ":" + std::to_string(c.port) + "：" + net.last_error();
-      return false;
+  // 收件人清洗：去空、去重、去 CR/LF，必须含 @
+  std::vector<std::string> rc;
+  for (const auto& r : rcpts) {
+    std::string a = util::sanitize_header(util::trim(r));
+    if (a.empty() || a.find('@') == std::string::npos) continue;
+    bool dup = false;
+    for (const auto& x : rc) {
+      if (util::to_lower(x) == util::to_lower(a)) { dup = true; break; }
     }
+    if (!dup) rc.push_back(a);
   }
+  if (rc.empty()) { err = "收件人不能为空"; return false; }
+
+  SmtpConfig c = cfg;
+  Net net;
+  bool used_tls = cfg.ssl;
+  std::string tls_reason, cerr;
+  // 配置为 SSL 但握手失败（常见于端口误勾 SSL 或本机根证书缺失）：
+  // 自动回退明文 + STARTTLS 升级；失败时错误信息保留 TLS 原因。
+  if (!connect_mail(net, c.host, c.port, cfg.ssl, 20000, used_tls, tls_reason, cerr)) {
+    err = "无法连接 SMTP 服务器 " + c.host + ":" + std::to_string(c.port) + "：" + cerr +
+          tls_fallback_note(tls_reason);
+    return false;
+  }
+  c.ssl = used_tls;
   int code = 0;
   std::string text;
   if (!read_response(net, code, text) || code != 220) {
-    err = "SMTP 问候失败: " + text;
+    err = "SMTP 问候失败: " + text + tls_fallback_note(tls_reason);
     return false;
   }
   if (!smtp_ehlo(net, text)) { err = "SMTP EHLO 失败: " + text; return false; }
@@ -443,20 +703,23 @@ bool smtp_send(const SmtpConfig& cfg, const std::string& to_addr, const std::str
   const std::string from = c.from_addr.empty() ? c.user : c.from_addr;
   // SMTP 命令与信封同样做注入防护：地址里不允许 CR/LF
   const std::string from_safe = util::sanitize_header(from);
-  const std::string to_safe = util::sanitize_header(to_addr);
   if (!net.send_all("MAIL FROM:<" + from_safe + ">\r\n")) { err = "SMTP MAIL FROM 失败"; return false; }
   if (!read_response(net, code, text) || code != 250) { err = "SMTP MAIL FROM 被拒绝: " + text; return false; }
-  if (!net.send_all("RCPT TO:<" + to_safe + ">\r\n")) { err = "SMTP RCPT TO 失败"; return false; }
-  if (!read_response(net, code, text) || (code != 250 && code != 251)) { err = "SMTP RCPT TO 被拒绝: " + text; return false; }
+  for (const auto& to : rc) {
+    if (!net.send_all("RCPT TO:<" + to + ">\r\n")) { err = "SMTP RCPT TO 失败"; return false; }
+    if (!read_response(net, code, text) || (code != 250 && code != 251)) {
+      err = "SMTP RCPT TO 被拒绝（" + to + "）: " + text;
+      return false;
+    }
+  }
   if (!net.send_all("DATA\r\n")) { err = "SMTP DATA 失败"; return false; }
   if (!read_response(net, code, text) || code != 354) { err = "SMTP DATA 未接受: " + text; return false; }
 
-  std::string msg = mime::build_message(c.display_name, from, to_addr, subject, body);
   std::string data;
   size_t start = 0;
-  while (start < msg.size()) {
-    size_t e = msg.find('\n', start);
-    std::string line = (e == std::string::npos) ? msg.substr(start) : msg.substr(start, e - start);
+  while (start < raw_message.size()) {
+    size_t e = raw_message.find('\n', start);
+    std::string line = (e == std::string::npos) ? raw_message.substr(start) : raw_message.substr(start, e - start);
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (!line.empty() && line[0] == '.') line = "." + line;
     data += line + "\r\n";
@@ -470,25 +733,29 @@ bool smtp_send(const SmtpConfig& cfg, const std::string& to_addr, const std::str
   return true;
 }
 
+bool smtp_send(const SmtpConfig& cfg, const std::string& to_addr, const std::string& subject,
+               const std::string& body, std::string& err) {
+  const std::string from = cfg.from_addr.empty() ? cfg.user : cfg.from_addr;
+  std::string raw = mime::build_message(cfg.display_name, from, to_addr, subject, body);
+  return smtp_send_raw(cfg, std::vector<std::string>{to_addr}, raw, err);
+}
+
 FetchResult pop3_fetch(const Pop3Config& cfg, const std::set<std::string>& seen_uidls, int max_new) {
   FetchResult res;
   if (cfg.host.empty()) { res.error = "POP3 服务器未配置"; return res; }
-  bool want_tls = cfg.ssl;
   Net net;
-  if (!net.connect(cfg.host, cfg.port, want_tls, 20000)) {
-    if (want_tls && net.last_error().find("TLS 握手失败") != std::string::npos) {
-      want_tls = false;
-      if (!net.connect(cfg.host, cfg.port, false, 20000)) {
-        res.error = "无法连接 POP3 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + net.last_error();
-        return res;
-      }
-    } else {
-      res.error = "无法连接 POP3 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + net.last_error();
-      return res;
-    }
+  bool want_tls = cfg.ssl;
+  std::string tls_reason, cerr;
+  if (!connect_mail(net, cfg.host, cfg.port, cfg.ssl, 20000, want_tls, tls_reason, cerr)) {
+    res.error = "无法连接 POP3 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + cerr +
+                tls_fallback_note(tls_reason);
+    return res;
   }
   std::string line;
-  if (!net.recv_line(line) || !util::starts_with(line, "+OK")) { res.error = "POP3 问候失败"; return res; }
+  if (!net.recv_line(line) || !util::starts_with(line, "+OK")) {
+    res.error = "POP3 问候失败" + tls_fallback_note(tls_reason);
+    return res;
+  }
   if (!want_tls) {
     // POP3 STLS：服务器通告后升级加密（110 端口常用）
     std::string caps;
@@ -524,17 +791,34 @@ FetchResult pop3_fetch(const Pop3Config& cfg, const std::set<std::string>& seen_
     std::vector<std::string> p = util::split(line, ' ');
     if (p.size() >= 2 && !p[0].empty()) uidl.emplace_back(p[0], p[1]);
   }
+  size_t round_bytes = 0;  // 本轮已拉取字节数（含超限跳过的邮件）
   for (const auto& kv : uidl) {
     if (seen_uidls.count(kv.second)) continue;
     if ((int)res.messages.size() >= max_new) break;  // 单轮上限，剩余的下一轮再取
+    if (round_bytes >= kMaxRoundBytes) break;        // 单轮累计预算用完，剩余下轮再取
     if (!net.send_all("RETR " + kv.first + "\r\n")) { res.error = "POP3 RETR 发送失败"; return res; }
     if (!net.recv_line(line) || !util::starts_with(line, "+OK")) continue; // skip broken message
     std::string raw;
+    size_t msg_bytes = 0;
+    bool over_limit = false;
     for (;;) {
       if (!net.recv_line(line)) { res.error = "POP3 RETR 读取中断"; return res; }
       if (line == ".") break;
       if (!line.empty() && line[0] == '.') line = line.substr(1);
+      if (over_limit) continue;  // 已超单封上限：只读空到 "."，不再累积
+      msg_bytes += line.size() + 2;
+      if (msg_bytes > kMaxMailBytes) {  // 单封 >50MB：丢弃内容，消息仍记 seen
+        over_limit = true;
+        raw.clear();
+        raw.shrink_to_fit();
+        continue;
+      }
       raw += line + "\r\n";
+    }
+    round_bytes += msg_bytes;
+    if (over_limit) {
+      res.new_keys.push_back(kv.second);  // 记 seen，避免每轮重复下载超大邮件
+      continue;
     }
     mime::Msg m;
     mime::parse_message(raw, m);
@@ -571,11 +855,36 @@ bool imap_read_until(Net& net, const std::string& tag, std::string& status, std:
   }
 }
 
-bool imap_fetch_one(Net& net, const std::string& tag, int uid, std::string& raw, std::string& status) {
+// 从 FETCH 响应行解析 literal 大小（如 "* 1 FETCH (UID 1 BODY[] {123}"）。
+// 兼容 BODY[] / BODY.PEEK[] / RFC822 等不同服务器写法：取行内 "{<digits>}" 解析。
+bool parse_literal_size(const std::string& line, size_t& out) {
+  auto brace = line.rfind('{');
+  if (brace == std::string::npos) return false;
+  auto close = line.find('}', brace + 1);
+  if (close == std::string::npos) return false;
+  size_t n = 0;
+  bool any = false;
+  for (size_t k = brace + 1; k < close; ++k) {
+    if (!isdigit((unsigned char)line[k])) return false;
+    n = n * 10 + (size_t)(line[k] - '0');
+    any = true;
+  }
+  if (!any) return false;
+  out = n;
+  return true;
+}
+
+// 拉取单封 IMAP 邮件。out_bytes 返回该封 literal 大小；too_large 表示超过单封上限
+// （此时 literal 已被读空丢弃，协议流保持对齐，调用方应把该 UID 记 seen）。
+// 2.1：使用 BODY.PEEK[]（不改变服务器 \Seen），RFC822/BODY[] 会自动置已读。
+bool imap_fetch_one(Net& net, const std::string& tag, int uid, std::string& raw, std::string& status,
+                    size_t& out_bytes, bool& too_large) {
   // 用 UID FETCH（而不是按序号 FETCH）：序号会随邮箱压缩/删除漂移，
   // UID 在邮箱生命周期内稳定，配合 seen_uid 才能可靠去重/标已读。
-  if (!net.send_all(tag + " UID FETCH " + std::to_string(uid) + " (RFC822)\r\n")) return false;
+  if (!net.send_all(tag + " UID FETCH " + std::to_string(uid) + " (BODY.PEEK[])\r\n")) return false;
   raw.clear();
+  out_bytes = 0;
+  too_large = false;
   std::string line;
   for (;;) {
     if (!net.recv_line(line)) return false;
@@ -584,48 +893,69 @@ bool imap_fetch_one(Net& net, const std::string& tag, int uid, std::string& raw,
       status = p.size() >= 2 ? p[1] : "";
       return true;
     }
-    auto lit = line.find("RFC822 {");
-    if (lit != std::string::npos) {
-      auto close = line.find('}', lit);
-      if (close != std::string::npos) {
-        size_t n = 0;
-        bool ok = true;
-        for (size_t k = lit + 8; k < close; ++k) {
-          if (!isdigit((unsigned char)line[k])) { ok = false; break; }
-          n = n * 10 + (size_t)(line[k] - '0');
-        }
-        if (ok && n > 0 && n < 50u * 1024 * 1024) {
-          std::string lit_data;
-          if (!net.recv_exact(lit_data, n)) return false;
-          raw = lit_data;
-        }
+    size_t n = 0;
+    if (parse_literal_size(line, n) && n > 0) {
+      out_bytes = n;
+      if (n > kMaxMailBytes) {
+        // 超大邮件：读空 literal 保持协议对齐，不分配大内存
+        too_large = true;
+        if (!net.skip_exact(n)) return false;
+      } else {
+        std::string lit_data;
+        if (!net.recv_exact(lit_data, n)) return false;
+        raw = std::move(lit_data);
       }
     }
   }
 }
 
+// 2.1：批量标记 \Seen（每 batch_size 个 uid 一条 UID STORE，避免逐条往返）。
+// 成功（服务器返回 OK）的 uid 追加到 out_marked；失败不影响收信，保留给下次重试。
+void imap_mark_seen(Net& net, const std::set<std::string>& uids, std::vector<std::string>& out_marked) {
+  constexpr size_t kBatch = 50;
+  std::vector<std::string> batch;
+  batch.reserve(kBatch);
+  auto flush = [&](int& tagseq) {
+    if (batch.empty()) return;
+    std::string csv;
+    for (size_t i = 0; i < batch.size(); ++i) {
+      if (i) csv += ",";
+      csv += batch[i];
+    }
+    std::string tag = "ms" + std::to_string(tagseq++);
+    std::string status;
+    if (net.send_all(tag + " UID STORE " + csv + " +FLAGS.SILENT (\\Seen)\r\n") &&
+        imap_read_until(net, tag, status, nullptr) && status == "OK") {
+      for (const auto& u : batch) out_marked.push_back(u);
+    }
+    batch.clear();
+  };
+  int tagseq = 0;
+  for (const auto& u : uids) {
+    if (u.empty()) continue;
+    batch.push_back(u);
+    if (batch.size() >= kBatch) flush(tagseq);
+  }
+  flush(tagseq);
+}
+
 } // namespace
 
-FetchResult imap_fetch(const ImapConfig& cfg, const std::set<std::string>& seen_uids, int max_new) {
+FetchResult imap_fetch(const ImapConfig& cfg, const std::set<std::string>& seen_uids, int max_new,
+                       const std::set<std::string>& mark_seen_uids) {
   FetchResult res;
   if (cfg.host.empty()) { res.error = "IMAP 服务器未配置"; return res; }
-  bool want_tls = cfg.ssl;
   Net net;
-  if (!net.connect(cfg.host, cfg.port, want_tls, 20000)) {
-    if (want_tls && net.last_error().find("TLS 握手失败") != std::string::npos) {
-      want_tls = false;
-      if (!net.connect(cfg.host, cfg.port, false, 20000)) {
-        res.error = "无法连接 IMAP 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + net.last_error();
-        return res;
-      }
-    } else {
-      res.error = "无法连接 IMAP 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + net.last_error();
-      return res;
-    }
+  bool want_tls = cfg.ssl;
+  std::string tls_reason, cerr;
+  if (!connect_mail(net, cfg.host, cfg.port, cfg.ssl, 20000, want_tls, tls_reason, cerr)) {
+    res.error = "无法连接 IMAP 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + cerr +
+                tls_fallback_note(tls_reason);
+    return res;
   }
   std::string line;
   if (!net.recv_line(line) || !util::starts_with(line, "* OK")) {
-    res.error = "IMAP 问候失败: " + line;
+    res.error = "IMAP 问候失败: " + line + tls_fallback_note(tls_reason);
     return res;
   }
   // 明文连接（143 等）时：若服务器通告 STARTTLS 则升级加密（很多服务端要求加密后才允许 LOGIN）
@@ -666,6 +996,11 @@ FetchResult imap_fetch(const ImapConfig& cfg, const std::set<std::string>& seen_
     res.error = "IMAP 打开收件箱失败";
     return res;
   }
+  // 2.1：先把用户已打开会话的 UID 批量标为 \Seen（失败不影响收信，下次重试）。
+  // 关键：收信本身用 BODY.PEEK[]，不会自动置已读；只有这里显式标记。
+  if (!mark_seen_uids.empty()) {
+    imap_mark_seen(net, mark_seen_uids, res.seen_marked);
+  }
   // 用 UID SEARCH 而不是 SEARCH：返回的是稳定的 UID。
   // 注意：不带 CHARSET 参数 —— 网易 Coremail 对带 CHARSET 的 UID SEARCH 返回
   // "BAD Could not parse command"，与 phllite(hellopinghe) 的研究结论一致。
@@ -684,25 +1019,31 @@ FetchResult imap_fetch(const ImapConfig& cfg, const std::set<std::string>& seen_
       if (!p[k].empty() && isdigit((unsigned char)p[k][0])) uids.push_back(atoi(p[k].c_str()));
     }
   }
-  std::set<int> to_mark;
+  size_t round_bytes = 0;  // 本轮已拉取字节数（含超限跳过的邮件）
   for (int uid : uids) {
     std::string key = std::to_string(uid);
     if (seen_uids.count(key)) continue;
     if ((int)res.messages.size() >= max_new) break;  // 单轮上限，剩余的下一轮再取
+    if (round_bytes >= kMaxRoundBytes) break;        // 单轮累计预算用完，剩余下轮再取
     std::string raw;
     std::string st;
-    if (!imap_fetch_one(net, "a4", uid, raw, st)) { res.error = "IMAP FETCH 读取中断"; return res; }
+    size_t bytes = 0;
+    bool too_large = false;
+    if (!imap_fetch_one(net, "a4", uid, raw, st, bytes, too_large)) {
+      res.error = "IMAP FETCH 读取中断";
+      return res;
+    }
+    round_bytes += bytes;
+    if (too_large) {
+      res.new_keys.push_back(key);  // 单封 >50MB：跳过并记 seen，避免每轮重复下载
+      continue;
+    }
     if (st != "OK" || raw.empty()) continue;
     mime::Msg m;
     mime::parse_message(raw, m);
+    m.uid = key;  // 2.1：记录 IMAP UID（用于之后“打开会话=标已读”）
     res.messages.push_back(m);
     res.new_keys.push_back(key);
-    to_mark.insert(uid);
-  }
-  for (int uid : to_mark) {
-    net.send_all("a5 UID STORE " + std::to_string(uid) + " +FLAGS.SILENT (\\Seen)\r\n");
-    std::string st;
-    imap_read_until(net, "a5", st, nullptr);
   }
   net.send_all("a6 LOGOUT\r\n");
   res.ok = true;
@@ -713,27 +1054,25 @@ bool test_smtp(const SmtpConfig& cfg, std::string& err) {
   err.clear();
   if (cfg.host.empty()) { err = "SMTP 服务器未配置"; return false; }
   SmtpConfig c = cfg;
-  bool want_tls = cfg.ssl;
   Net net;
-  if (!net.connect(c.host, c.port, want_tls, 15000)) {
-    if (want_tls && net.last_error().find("TLS 握手失败") != std::string::npos) {
-      want_tls = false;
-      c.ssl = false;
-      if (!net.connect(c.host, c.port, false, 15000)) {
-        err = "无法连接 SMTP 服务器 " + c.host + ":" + std::to_string(c.port) + "：" +
-              net.last_error() + "（网易企业邮箱用 994+SSL，163/QQ 个人邮箱用 465+SSL）";
-        return false;
-      }
-    } else {
-      err = "无法连接 SMTP 服务器 " + c.host + ":" + std::to_string(c.port) + "：" +
-            net.last_error() + "（网易企业邮箱用 994+SSL，163/QQ 个人邮箱用 465+SSL）";
-      return false;
-    }
+  bool used_tls = cfg.ssl;
+  std::string tls_reason, cerr;
+  if (!connect_mail(net, c.host, c.port, cfg.ssl, 15000, used_tls, tls_reason, cerr)) {
+    err = "无法连接 SMTP 服务器 " + c.host + ":" + std::to_string(c.port) + "：" + cerr +
+          "（网易企业邮箱用 994+SSL，163/QQ 个人邮箱用 465+SSL）" + tls_fallback_note(tls_reason);
+    return false;
   }
+  c.ssl = used_tls;
   int code = 0;
   std::string text;
-  if (!read_response(net, code, text) || code != 220) { err = "SMTP 问候失败: " + text; return false; }
-  if (!smtp_ehlo(net, text)) { err = "EHLO 失败: " + text; return false; }
+  if (!read_response(net, code, text) || code != 220) {
+    err = "SMTP 问候失败: " + text + tls_fallback_note(tls_reason);
+    return false;
+  }
+  if (!smtp_ehlo(net, text)) {
+    err = "EHLO 失败: " + text + tls_fallback_note(tls_reason);
+    return false;
+  }
   if (!smtp_maybe_starttls(net, c, text, err)) return false;
   bool authed = false;
   if (net.send_all("AUTH LOGIN\r\n") && read_response(net, code, text) && code == 334) {
@@ -753,24 +1092,19 @@ bool test_smtp(const SmtpConfig& cfg, std::string& err) {
 bool test_pop3(const Pop3Config& cfg, std::string& err) {
   err.clear();
   if (cfg.host.empty()) { err = "POP3 服务器未配置"; return false; }
-  bool want_tls = cfg.ssl;
   Net net;
-  if (!net.connect(cfg.host, cfg.port, want_tls, 15000)) {
-    if (want_tls && net.last_error().find("TLS 握手失败") != std::string::npos) {
-      want_tls = false;
-      if (!net.connect(cfg.host, cfg.port, false, 15000)) {
-        err = "无法连接 POP3 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" +
-              net.last_error() + "（POP3 常用 995+SSL；也可改用 IMAP 993+SSL）";
-        return false;
-      }
-    } else {
-      err = "无法连接 POP3 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" +
-            net.last_error() + "（POP3 常用 995+SSL；也可改用 IMAP 993+SSL）";
-      return false;
-    }
+  bool want_tls = cfg.ssl;
+  std::string tls_reason, cerr;
+  if (!connect_mail(net, cfg.host, cfg.port, cfg.ssl, 15000, want_tls, tls_reason, cerr)) {
+    err = "无法连接 POP3 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + cerr +
+          "（POP3 常用 995+SSL；也可改用 IMAP 993+SSL）" + tls_fallback_note(tls_reason);
+    return false;
   }
   std::string line;
-  if (!net.recv_line(line) || !util::starts_with(line, "+OK")) { err = "POP3 问候失败"; return false; }
+  if (!net.recv_line(line) || !util::starts_with(line, "+OK")) {
+    err = "POP3 问候失败" + tls_fallback_note(tls_reason);
+    return false;
+  }
   if (!want_tls) {
     // POP3 STLS：服务器通告后升级加密（110 端口常用）
     std::string caps;
@@ -805,24 +1139,19 @@ bool test_pop3(const Pop3Config& cfg, std::string& err) {
 bool test_imap(const ImapConfig& cfg, std::string& err) {
   err.clear();
   if (cfg.host.empty()) { err = "IMAP 服务器未配置"; return false; }
-  bool want_tls = cfg.ssl;
   Net net;
-  if (!net.connect(cfg.host, cfg.port, want_tls, 15000)) {
-    if (want_tls && net.last_error().find("TLS 握手失败") != std::string::npos) {
-      want_tls = false;
-      if (!net.connect(cfg.host, cfg.port, false, 15000)) {
-        err = "无法连接 IMAP 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" +
-              net.last_error() + "（IMAP 常用 993+SSL）";
-        return false;
-      }
-    } else {
-      err = "无法连接 IMAP 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" +
-            net.last_error() + "（IMAP 常用 993+SSL）";
-      return false;
-    }
+  bool want_tls = cfg.ssl;
+  std::string tls_reason, cerr;
+  if (!connect_mail(net, cfg.host, cfg.port, cfg.ssl, 15000, want_tls, tls_reason, cerr)) {
+    err = "无法连接 IMAP 服务器 " + cfg.host + ":" + std::to_string(cfg.port) + "：" + cerr +
+          "（IMAP 常用 993+SSL）" + tls_fallback_note(tls_reason);
+    return false;
   }
   std::string line;
-  if (!net.recv_line(line) || !util::starts_with(line, "* OK")) { err = "IMAP 问候失败"; return false; }
+  if (!net.recv_line(line) || !util::starts_with(line, "* OK")) {
+    err = "IMAP 问候失败" + tls_fallback_note(tls_reason);
+    return false;
+  }
   if (!want_tls) {
     std::string st;
     std::vector<std::string> u0;
@@ -859,6 +1188,7 @@ bool probe_greeting(const std::string& host, int port, bool ssl, int timeout_ms,
   Net net;
   if (!net.connect(host, port, ssl, timeout_ms)) {
     err = "连接失败（端口不通 / 被防火墙拦截 / 主机名错误）";
+    if (!net.last_error().empty()) err += "：" + net.last_error();
     return false;
   }
   std::string line;

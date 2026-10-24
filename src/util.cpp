@@ -44,9 +44,13 @@ int64_t Json::as_int64(int64_t def) const { return type == Number ? (int64_t)num
 
 namespace {
 struct JParser {
+  // 最大嵌套深度（安全边界）：防止构造的超深 JSON（如 '['*60000）递归耗尽栈。
+  // 合法业务 JSON 深度远小于此值（消息对象/quote 只有 2-3 层）。
+  static constexpr int kMaxDepth = 64;
   const std::string& s;
   size_t i = 0;
   std::string err;
+  int depth = 0;
   explicit JParser(const std::string& str) : s(str) {}
   void skip_ws() {
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
@@ -56,6 +60,13 @@ struct JParser {
     return false;
   }
   bool parse_value(Json& out) {
+    if (depth >= kMaxDepth) return fail("嵌套过深");
+    ++depth;
+    bool ok = parse_value_inner(out);
+    --depth;
+    return ok;
+  }
+  bool parse_value_inner(Json& out) {
     skip_ws();
     if (i >= s.size()) return fail("unexpected end of input");
     char c = s[i];
@@ -380,6 +391,54 @@ std::string sanitize_header(const std::string& s) {
   for (char c : s) {
     if (c == '\r' || c == '\n' || c == '\0') out += ' ';
     else out += c;
+  }
+  return out;
+}
+
+std::string truncate_utf8_chars(const std::string& s, size_t max_chars) {
+  size_t chars = 0;
+  size_t i = 0;
+  while (i < s.size() && chars < max_chars) {
+    unsigned char c = (unsigned char)s[i];
+    size_t len = 1;
+    if (c >= 0xF0) len = 4;
+    else if (c >= 0xE0) len = 3;
+    else if (c >= 0xC0) len = 2;
+    if (i + len > s.size()) len = s.size() - i;  // 非法/截断序列按剩余字节处理
+    i += len;
+    ++chars;
+  }
+  return s.substr(0, i);
+}
+
+size_t utf8_chars(const std::string& s) {
+  size_t chars = 0;
+  size_t i = 0;
+  while (i < s.size()) {
+    unsigned char c = (unsigned char)s[i];
+    size_t len = 1;
+    if (c >= 0xF0) len = 4;
+    else if (c >= 0xE0) len = 3;
+    else if (c >= 0xC0) len = 2;
+    if (i + len > s.size()) len = s.size() - i;
+    i += len;
+    ++chars;
+  }
+  return chars;
+}
+
+std::string url_encode_component(const std::string& s) {
+  static const char* hexd = "0123456789ABCDEF";
+  std::string out;
+  for (unsigned char c : s) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+        c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else {
+      out += '%';
+      out += hexd[c >> 4];
+      out += hexd[c & 15];
+    }
   }
   return out;
 }

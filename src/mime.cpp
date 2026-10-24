@@ -1,5 +1,6 @@
 #include "mime.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -205,7 +206,54 @@ struct PartContent {
   std::string type; // "text/plain" or "text/html"
 };
 
-void collect_text(const std::string& raw_part, std::vector<PartContent>& out) {
+// RFC2231 参数值（"UTF-8''%E4%B8%AD" 或纯 %XX）解码。
+std::string decode_rfc2231(const std::string& v) {
+  std::string s = v;
+  // 形如 charset'lang'data
+  size_t a = s.find('\'');
+  size_t b = (a == std::string::npos) ? std::string::npos : s.find('\'', a + 1);
+  std::string charset;
+  if (a != std::string::npos && b != std::string::npos) {
+    charset = s.substr(0, a);
+    s = s.substr(b + 1);
+  }
+  std::string out;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      auto hex = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return -1;
+      };
+      int x = hex(s[i + 1]), y = hex(s[i + 2]);
+      if (x >= 0 && y >= 0) { out += (char)((x << 4) | y); i += 2; continue; }
+    }
+    out += s[i];
+  }
+  if (!charset.empty() && util::to_lower(charset) != "utf-8" && util::to_lower(charset) != "utf8") {
+    out = util::charset_to_utf8(out, charset);
+  }
+  return out;
+}
+
+std::string part_filename(const Headers& h, const ContentType& ct, const ContentType& disp) {
+  std::string name;
+  auto it = disp.params.find("filename");
+  if (it != disp.params.end()) name = it->second;
+  auto it2 = disp.params.find("filename*");
+  if (it2 != disp.params.end() && !it2->second.empty()) name = decode_rfc2231(it2->second);
+  if (name.empty()) {
+    auto it3 = ct.params.find("name");
+    if (it3 != ct.params.end()) name = it3->second;
+  }
+  if (name.empty()) name = "attachment";
+  return sanitize_filename(decode_encoded_words(name));
+}
+
+void collect_parts(const std::string& raw_part, std::vector<PartContent>& texts,
+                   std::vector<Attachment>& atts, long long& att_total, int depth) {
+  if (depth > 12) return;
   size_t pos = raw_part.find("\r\n\r\n");
   size_t seplen = 4;
   if (pos == std::string::npos) {
@@ -225,22 +273,45 @@ void collect_text(const std::string& raw_part, std::vector<PartContent>& out) {
   if (util::starts_with(ct.type, "multipart/")) {
     auto it = ct.params.find("boundary");
     if (it != ct.params.end() && !it->second.empty()) {
-      for (const auto& part : split_multipart(body, it->second)) collect_text(part, out);
+      for (const auto& part : split_multipart(body, it->second)) {
+        collect_parts(part, texts, atts, att_total, depth + 1);
+      }
     }
     return;
   }
-  std::string cte = util::to_lower(h.get("content-transfer-encoding", ""));
+  const std::string cte = util::to_lower(h.get("content-transfer-encoding", ""));
   std::string decoded = body;
   if (cte == "base64") decoded = util::b64_decode(body);
   else if (cte == "quoted-printable") decoded = util::qp_decode(body);
-  std::string charset = "";
+
+  ContentType disp = parse_content_type(h.get("content-disposition", ""));
+  const bool disp_attach = util::starts_with(util::to_lower(util::trim(disp.type)), "attachment");
+  const bool has_filename = disp.params.count("filename") || disp.params.count("filename*") ||
+                            ct.params.count("name");
+  const bool is_leaf_text = (ct.type == "text/plain" || ct.type == "text/html");
+  if (!is_leaf_text || disp_attach || has_filename) {
+    // 附件：单附件 ≤16MB，合计 ≤24MB，超限跳过（消息仍写入）
+    long long sz = (long long)decoded.size();
+    if (sz > kMaxAttachmentBytes) return;
+    if (att_total + sz > kMaxAttachmentsTotal) return;
+    Attachment a;
+    a.name = part_filename(h, ct, disp);
+    a.mime = ct.type.empty() ? "application/octet-stream" : ct.type;
+    a.size = sz;
+    a.data = decoded;
+    a.inline_ = is_image_mime(a.mime);
+    att_total += sz;
+    atts.push_back(std::move(a));
+    return;
+  }
+  std::string charset;
   auto ci = ct.params.find("charset");
   if (ci != ct.params.end()) charset = ci->second;
   decoded = util::charset_to_utf8(decoded, charset);
-  if (ct.type == "text/plain") {
-    out.push_back({decoded, "text/plain"});
-  } else if (ct.type == "text/html") {
-    out.push_back({strip_html(decoded), "text/html"});
+  if (ct.type == "text/html") {
+    texts.push_back({strip_html(decoded), "text/html"});
+  } else {
+    texts.push_back({decoded, "text/plain"});
   }
 }
 
@@ -251,6 +322,92 @@ int64_t days_from_civil(int y, unsigned m, unsigned d) {
   const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
   const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+std::string random_hex(size_t n) {
+  // thread_local：build_message 会被多个 HTTP 连接线程并发调用，静态 rng 有数据竞争
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  static const char* hexd = "0123456789abcdef";
+  std::string out;
+  for (size_t i = 0; i < n; ++i) out += hexd[rng() & 15];
+  return out;
+}
+
+std::string sanitize_mime(const std::string& raw) {
+  std::string m = util::to_lower(util::trim(raw));
+  auto semi = m.find(';');
+  if (semi != std::string::npos) m = util::trim(m.substr(0, semi));
+  if (m.empty() || m.find('/') == std::string::npos) return "application/octet-stream";
+  std::string out;
+  for (char c : m) {
+    if (isalnum((unsigned char)c) || c == '/' || c == '.' || c == '+' || c == '-' || c == '_') out += c;
+  }
+  if (out.empty() || out.find('/') == std::string::npos) return "application/octet-stream";
+  return out;
+}
+
+// 附件头里的引号字符串转义
+std::string escape_quoted(const std::string& s) {
+  std::string out;
+  for (char c : s) {
+    if (c == '"' || c == '\\') out += '\\';
+    out += c;
+  }
+  return out;
+}
+
+// 文件名头编码：ASCII 原样（清洗 CR/LF），非 ASCII 用 RFC2047 B 编码。
+std::string encode_filename_value(const std::string& s) {
+  std::string safe = util::sanitize_header(s);
+  if (util::is_ascii(safe)) return safe;
+  return "=?UTF-8?B?" + util::b64_encode(safe) + "?=";
+}
+
+void append_b64(std::string& out, const std::string& data) {
+  const std::string b = util::b64_encode(data);
+  for (size_t i = 0; i < b.size(); i += 76) out += b.substr(i, 76) + "\r\n";
+}
+
+// X-Email-Chatter-Quote：base64，76 字符折行，续行以单个空格开头。
+void append_quote_header(std::string& msg, const Quote& q) {
+  util::Json j = util::Json::make_object();
+  j["text"] = util::Json::make_string(util::truncate_utf8_chars(q.text, 500));
+  j["from"] = util::Json::make_string(q.from);
+  j["ts"] = util::Json::make_number((double)q.ts);
+  j["mid"] = util::Json::make_string(q.mid);
+  const std::string b64 = util::b64_encode(j.dump());
+  std::string line = "X-Email-Chatter-Quote: ";
+  size_t pos = 0;
+  bool first = true;
+  while (pos < b64.size()) {
+    std::string chunk = b64.substr(pos, 76);
+    if (first) {
+      line += chunk;
+      first = false;
+    } else {
+      line += "\r\n " + chunk;
+    }
+    pos += 76;
+  }
+  msg += line + "\r\n";
+}
+
+std::string quote_block(const Quote& q) {
+  std::string out = "\n\n--- 引用 ---\n";
+  out += "> 发件人：" + (q.from.empty() ? std::string("未知") : q.from) + "\n";
+  std::string t;
+  if (q.ts > 0) {
+    t = util::format_local_full(q.ts);
+    if (t.size() > 16) t = t.substr(0, 16);  // YYYY-MM-DD HH:MM
+  }
+  out += "> 时间：" + t + "\n";
+  std::vector<std::string> lines = util::split(q.text, '\n');
+  for (auto& l : lines) {
+    std::string s = l;
+    if (!s.empty() && s.back() == '\r') s.pop_back();
+    out += "> " + s + "\n";
+  }
+  return out;
 }
 
 } // namespace
@@ -366,7 +523,41 @@ std::string encode_header(const std::string& s) {
   return "=?UTF-8?B?" + util::b64_encode(safe) + "?=";
 }
 
+bool is_image_mime(const std::string& mime) {
+  std::string m = util::to_lower(util::trim(mime));
+  auto semi = m.find(';');
+  if (semi != std::string::npos) m = util::trim(m.substr(0, semi));
+  return m == "image/png" || m == "image/jpeg" || m == "image/jpg" || m == "image/gif" ||
+         m == "image/webp" || m == "image/bmp";
+}
+
+std::string sanitize_filename(const std::string& name, size_t max_chars) {
+  std::string s = util::trim(name);
+  std::string out;
+  for (unsigned char c : s) {
+    if (c == '/' || c == '\\' || c == '\0' || c == '\r' || c == '\n' || c < 0x20) continue;
+    out += (char)c;
+  }
+  while (!out.empty() && (out.front() == '.' || out.front() == ' ')) out.erase(out.begin());
+  while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
+  if (out.empty()) out = "file";
+  if (max_chars > 0) out = util::truncate_utf8_chars(out, max_chars);
+  return out;
+}
+
+namespace {
+std::string jstr_quote(const util::Json& o, const char* k) {
+  const util::Json* v = o.get(k);
+  return v ? v->as_string() : std::string();
+}
+int64_t jint_quote(const util::Json& o, const char* k) {
+  const util::Json* v = o.get(k);
+  return v ? v->as_int64(0) : 0;
+}
+} // namespace
+
 bool parse_message(const std::string& raw, Msg& out) {
+  out = Msg();
   size_t pos = raw.find("\r\n\r\n");
   size_t seplen = 4;
   if (pos == std::string::npos) {
@@ -389,8 +580,40 @@ bool parse_message(const std::string& raw, Msg& out) {
   if (out.date_epoch == 0) out.date_epoch = util::now_epoch();
   out.message_id = util::trim(h.get("message-id"));
 
+  // X-Email-Chatter-Kind：缺省视为 chat
+  std::string kind = util::to_lower(util::trim(h.get("x-email-chatter-kind")));
+  out.kind = (kind == "email" || kind == "recall") ? kind : "chat";
+
+  // X-Email-Chatter-Recall：原消息 Message-ID
+  out.recall_mid = util::trim(util::sanitize_header(h.get("x-email-chatter-recall")));
+
+  // X-Email-Chatter-Quote：base64(JSON)，解析时删除所有空白再解码。
+  // 安全边界：头值限长 8KB，超长直接忽略 quote（不影响收信/不解析超长 JSON）。
+  std::string qv = h.get("x-email-chatter-quote");
+  if (!qv.empty() && qv.size() <= 8192) {
+    std::string compact;
+    for (char c : qv) {
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+      compact += c;
+    }
+    std::string qjson = util::b64_decode(compact);
+    // 解码后再限一次（8KB 头最多解出 ~6KB JSON），避免极端输入放大
+    if (qjson.size() <= 8192) {
+      util::Json q = util::Json::parse(qjson);
+      if (q.is_object()) {
+        out.has_quote = true;
+        out.quote.text = util::truncate_utf8_chars(jstr_quote(q, "text"), 500);
+        out.quote.from = jstr_quote(q, "from");
+        out.quote.ts = jint_quote(q, "ts");
+        out.quote.mid = jstr_quote(q, "mid");
+      }
+    }
+  }
+
   std::vector<PartContent> parts;
-  collect_text(raw, parts);
+  std::vector<Attachment> atts;
+  long long att_total = 0;
+  collect_parts(raw, parts, atts, att_total, 0);
   std::string text;
   for (const auto& p : parts) {
     if (p.type == "text/plain") { text = p.text; break; }
@@ -400,11 +623,23 @@ bool parse_message(const std::string& raw, Msg& out) {
       if (p.type == "text/html") { text = p.text; break; }
     }
   }
-  if (text.empty() && !raw_b.empty()) {
-    // fall back to raw body if no text part was found
+  // 仅当完全没有识别出任何 MIME part（既无文本段也无附件）时才回退原始 body。
+  // 有附件但无文本段的邮件正文应为空串，不能把 boundary/base64/头部当正文。
+  if (util::trim(text).empty() && parts.empty() && atts.empty() && !raw_b.empty()) {
     text = raw_b;
   }
+  // 有引用头时剥离正文里可读的引用块（从 "\n\n--- 引用 ---\n" 到末尾）
+  if (out.has_quote) {
+    size_t p = text.find("\r\n\r\n--- 引用 ---\r\n");
+    if (p != std::string::npos) {
+      text = text.substr(0, p);
+    } else {
+      p = text.find("\n\n--- 引用 ---\n");
+      if (p != std::string::npos) text = text.substr(0, p);
+    }
+  }
   out.body_text = util::trim(text);
+  out.attachments = std::move(atts);
   return true;
 }
 
@@ -413,7 +648,8 @@ namespace {
 // 修复原实现 rand()%100000 的问题：rand() 未播种、同一秒内多次发送会产生
 // 相同 Message-ID，导致接收端去重时把不同邮件误判为同一条而丢信。
 std::string make_msgid() {
-  static std::mt19937_64 rng{std::random_device{}()};
+  // thread_local：/api/send 会被多个 HTTP 连接线程并发调用，静态 rng 有数据竞争
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
   static std::atomic<uint64_t> counter{0};
   auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
@@ -424,31 +660,110 @@ std::string make_msgid() {
 }
 } // namespace
 
-std::string build_message(const std::string& from_display, const std::string& from_addr,
-                          const std::string& to_addr, const std::string& subject,
-                          const std::string& body, std::string* out_msgid) {
+// 2.1：Message-ID 合法性（用于 In-Reply-To/References；不合法则不加，避免伪造线程）
+bool valid_msgid(const std::string& mid) {
+  if (mid.size() < 3 || mid.size() > 320) return false;
+  if (mid.front() != '<' || mid.back() != '>') return false;
+  if (mid.find('<', 1) != std::string::npos) return false;
+  if (mid.find('>') != mid.size() - 1) return false;
+  for (char c : mid) {
+    if (c == '\r' || c == '\n' || c == '\0' || c == ' ' || c == '\t') return false;
+  }
+  return true;
+}
+
+// 2.1：主题加 "Re: " 前缀；大小写不敏感地判断已有 Re:（避免 Re: Re: ...）
+std::string with_re_prefix(const std::string& subject) {
+  std::string t = util::trim(subject);
+  if (t.size() >= 3 && (t[0] == 'r' || t[0] == 'R') && (t[1] == 'e' || t[1] == 'E') &&
+      t[2] == ':') {
+    return subject;
+  }
+  return "Re: " + subject;
+}
+
+std::string build_message(const ComposeOptions& opt, std::string* out_msgid) {
   std::string msgid = make_msgid();
   if (out_msgid) *out_msgid = msgid;
-  std::string msg;
+  std::string kind = opt.kind;
+  if (kind != "email" && kind != "recall") kind = "chat";
+  std::string subject = opt.subject;
+  if (kind == "recall" && subject.empty()) subject = "撤回了一条消息";
+
+  // 2.1 引用=reply：只有 quote.mid 合法时才加 In-Reply-To/References 与 Re: 前缀
+  const bool reply = opt.has_quote && valid_msgid(opt.quote.mid);
+  if (reply) subject = with_re_prefix(subject);
+
   // 地址/昵称/主题一律做注入清洗：不允许 CR/LF 进入任何头字段
-  std::string from = util::sanitize_header(from_addr);
-  std::string to = util::sanitize_header(to_addr);
-  std::string from_hdr = from_display.empty()
-                             ? from
-                             : encode_header(from_display) + " <" + from + ">";
+  const std::string from = util::sanitize_header(opt.from_addr);
+  const std::string to = util::sanitize_header(opt.to_addr);
+  const std::string from_hdr = opt.from_display.empty()
+                                   ? from
+                                   : encode_header(opt.from_display) + " <" + from + ">";
+
+  std::string body = opt.body;
+  if (opt.has_quote) body += quote_block(opt.quote);
+
+  std::string msg;
   msg += "From: " + from_hdr + "\r\n";
   msg += "To: <" + to + ">\r\n";
+  if (!util::trim(opt.cc).empty()) msg += "Cc: " + util::sanitize_header(opt.cc) + "\r\n";
   msg += "Subject: " + encode_header(subject) + "\r\n";
   msg += "Date: " + util::format_rfc5322(util::now_epoch()) + "\r\n";
   msg += "Message-ID: " + msgid + "\r\n";
+  if (reply) {
+    msg += "In-Reply-To: " + opt.quote.mid + "\r\n";
+    msg += "References: " + opt.quote.mid + "\r\n";
+  }
   msg += "MIME-Version: 1.0\r\n";
+  msg += "X-Email-Chatter: 1\r\n";
+  msg += "X-Email-Chatter-Kind: " + kind + "\r\n";
+  if (opt.has_quote) append_quote_header(msg, opt.quote);
+  if (kind == "recall" && !opt.recall_mid.empty()) {
+    msg += "X-Email-Chatter-Recall: " + util::sanitize_header(opt.recall_mid) + "\r\n";
+  }
+
+  if (opt.attachments.empty()) {
+    msg += "Content-Type: text/plain; charset=UTF-8\r\n";
+    msg += "Content-Transfer-Encoding: base64\r\n";
+    msg += "\r\n";
+    append_b64(msg, body);
+    return msg;
+  }
+
+  static std::atomic<uint64_t> seq{0};
+  const std::string boundary = "=ec_" + random_hex(12) + "_" + std::to_string(seq.fetch_add(1));
+  msg += "Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n";
+  msg += "\r\n";
+  msg += "--" + boundary + "\r\n";
   msg += "Content-Type: text/plain; charset=UTF-8\r\n";
   msg += "Content-Transfer-Encoding: base64\r\n";
-  msg += "X-Email-Chatter: 1\r\n";
   msg += "\r\n";
-  std::string b = util::b64_encode(body);
-  for (size_t i = 0; i < b.size(); i += 76) msg += b.substr(i, 76) + "\r\n";
+  append_b64(msg, body);
+  for (const auto& a : opt.attachments) {
+    const std::string fname = encode_filename_value(a.name.empty() ? "attachment" : a.name);
+    msg += "--" + boundary + "\r\n";
+    msg += "Content-Type: " + sanitize_mime(a.mime) + "; name=\"" + escape_quoted(fname) + "\"\r\n";
+    msg += "Content-Disposition: attachment; filename=\"" + escape_quoted(fname) + "\"\r\n";
+    msg += "Content-Transfer-Encoding: base64\r\n";
+    msg += "\r\n";
+    append_b64(msg, a.data);
+  }
+  msg += "--" + boundary + "--\r\n";
   return msg;
+}
+
+std::string build_message(const std::string& from_display, const std::string& from_addr,
+                          const std::string& to_addr, const std::string& subject,
+                          const std::string& body, std::string* out_msgid) {
+  ComposeOptions opt;
+  opt.from_display = from_display;
+  opt.from_addr = from_addr;
+  opt.to_addr = to_addr;
+  opt.subject = subject;
+  opt.body = body;
+  opt.kind = "chat";
+  return build_message(opt, out_msgid);
 }
 
 } // namespace mime
